@@ -1,0 +1,919 @@
+---
+title: "Shoot_DEseqAnalysis"
+author: "Yuchen Wang"
+date: "2026-02-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+```
+
+Load packages and data
+
+```{r libraries}
+library(DESeq2)
+
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+library(ggrepel)
+library(limma)
+```
+
+Read experiment design and count matrix
+
+```{r, read data}
+design_file <- here("Data", "data_for_publication", "Trait_A17_sunn.csv")
+count_file  <- here("Data", "data_for_publication", "ShootCounts_A17_sunn.csv")
+
+experiment_design <- read.csv(design_file, stringsAsFactors = FALSE)
+counts_df         <- read.csv(count_file,  stringsAsFactors = FALSE)
+
+# Count matrix: first column = GeneID, rest = sample counts
+gene_ids   <- counts_df[, 1]
+counts_mat <- as.matrix(counts_df[, -1])
+rownames(counts_mat) <- gene_ids
+
+# Design: use RNA.seq.id as sample ID; keep only samples present in both
+rownames(experiment_design) <- experiment_design$RNA.seq.id
+samples_in_both <- intersect(colnames(counts_mat), experiment_design$RNA.seq.id)
+
+# Remove outlier sample
+outlier_id <- "MTNC159"
+n_before <- length(samples_in_both)
+samples_in_both <- setdiff(samples_in_both, outlier_id)
+if (length(samples_in_both) < n_before) cat("Removed outlier sample:", outlier_id, "\n")
+
+counts_mat <- counts_mat[, samples_in_both, drop = FALSE]
+experiment_design <- experiment_design[samples_in_both, ]
+
+# Sanity check
+stopifnot(all(colnames(counts_mat) == experiment_design$RNA.seq.id))
+cat("Samples:", ncol(counts_mat), "\n")
+cat("Genes: ", nrow(counts_mat), "\n")
+```
+
+Preprocess CleanUp and Parameter Setting
+
+```{r define-factors}
+experiment_design$Line     <- factor(experiment_design$Line, levels = c("A17", "sunn"))
+experiment_design$Nitrogen <- as.numeric(as.character(experiment_design$Nitrogen))
+experiment_design$CO2      <- factor(experiment_design$CO2, levels = c("AC", "EC"))
+experiment_design$Replicate <- factor(experiment_design$Replicate)
+```
+
+#DESeq2 analysis
+
+```{r deseq-run}
+coldata <- experiment_design[colnames(counts_mat), ]
+
+dds <- DESeqDataSetFromMatrix(
+  countData = round(counts_mat),
+  colData   = coldata,
+  design    = ~ Replicate + Nitrogen + CO2 + Line + CO2:Nitrogen + Line:Nitrogen + Line:CO2
+)
+
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+dds <- DESeq(dds)
+
+out_dir <- here("Data", "data_for_publication", "DEG_analysis")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+saveRDS(dds, file.path(out_dir, "dds_shoot.rds"))
+```
+
+```{r all-contrasts}
+curated_gene_names <- readr::read_tsv(
+  here::here("MT_genome", "annotation", "MtrunA17r5.0-ANR-EGN-r1.9.gene_names.tsv"),
+  col_types = readr::cols(.default = readr::col_character())
+) %>%
+  dplyr::transmute(
+    gene = locus_tag,
+    curated_gene_name = acronym,
+    curated_gene_product = geneProduct
+  ) %>%
+  dplyr::distinct(gene, .keep_all = TRUE)
+
+genome_annotation <- readr::read_tsv(
+  here::here("MT_genome", "annotation", "MtrunA17r5.0-ANR-EGN-r1.9.summary.tsv"),
+  col_types = readr::cols(.default = readr::col_character())
+) %>%
+  dplyr::transmute(
+    gene = LOCUS_TAG,
+    summary_gene_name = GN,
+    summary_gene_product = PRODUCT
+  ) %>%
+  dplyr::distinct(gene, .keep_all = TRUE)
+
+gene_names <- dplyr::full_join(
+  genome_annotation,
+  curated_gene_names,
+  by = "gene"
+) %>%
+  dplyr::transmute(
+    gene,
+    gene_name = dplyr::coalesce(
+      dplyr::na_if(curated_gene_name, ""),
+      dplyr::na_if(summary_gene_name, ""),
+      ""
+    ),
+    gene_product = dplyr::coalesce(
+      dplyr::na_if(summary_gene_product, ""),
+      dplyr::na_if(curated_gene_product, ""),
+      ""
+    )
+  )
+
+# All coefficients from design (exclude Intercept and Replicate)
+coefs <- resultsNames(dds)
+coefs <- coefs[coefs != "Intercept" & !grepl("^Replicate", coefs)]
+
+all_deg_tables <- list()
+
+for (coef in coefs) {
+  res <- results(dds, name = coef)
+
+  res_df <- as.data.frame(res) %>%
+    rownames_to_column("gene") %>%
+    filter(!is.na(padj), padj < 0.05) %>%
+    left_join(gene_names, by = "gene") %>%
+    mutate(
+      gene_name = coalesce(gene_name, ""),
+      gene_product = coalesce(gene_product, ""),
+      coef = coef
+    ) %>%
+    dplyr::select(
+      coef, gene, gene_name, gene_product, log2FoldChange, padj
+    ) %>%
+    arrange(padj)
+
+  all_deg_tables[[coef]] <- res_df
+}
+
+# Write one combined DEG table
+all_deg_combined <- bind_rows(all_deg_tables)
+readr::write_csv(
+  all_deg_combined,
+  file.path(out_dir, "DEG_all_coefficients_combined.csv")
+)
+```
+
+## 2.4 DEG counts by model term
+
+Bar chart showing number of significant DEGs attributed to each term in the DESeq2 model.
+
+```{r deg-counts-by-term, fig.width=10, fig.height=6}
+deg_by_term <- tibble::tibble(
+  coefficient = names(all_deg_tables),
+  n_DEGs = vapply(all_deg_tables, nrow, integer(1))
+) %>%
+  dplyr::mutate(
+    TermType = dplyr::case_when(
+      grepl("\\.", coefficient) ~ "Interaction",
+      grepl("^Line", coefficient) ~ "Line",
+      grepl("^CO2", coefficient) ~ "CO2",
+      coefficient == "Nitrogen" ~ "Nitrogen",
+      TRUE ~ "Other"
+    ),
+    Term = dplyr::case_when(
+      TermType == "Line" ~ "sunn vs A17",
+      TermType == "CO2" ~ "CO2",
+      TermType == "Nitrogen" ~ "Nitrogen",
+      TRUE ~ stringr::str_replace_all(
+        coefficient,
+        c(
+          "CO2_EC_vs_AC|CO2EC" = "CO2",
+          "Line_sunn_vs_A17|Linesunn" = "Line",
+          "\\." = " × "
+        )
+      )
+    )
+  ) %>%
+  dplyr::filter(TermType != "Other") %>%
+  dplyr::mutate(
+    TermType = factor(
+      TermType,
+      levels = c("Line", "CO2", "Nitrogen", "Interaction")
+    ),
+    Term = forcats::fct_reorder(Term, n_DEGs, .desc = TRUE)
+  )
+
+ggplot(deg_by_term, aes(x = Term, y = n_DEGs, fill = TermType)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = n_DEGs), vjust = -0.5, size = 3.5, fontface = "bold") +
+  scale_fill_manual(
+    values = c(Line = "chocolate2", CO2 = "cadetblue4", Nitrogen = "darkolivegreen", Interaction = "coral4"),
+    name = "Term type"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    x = NULL,
+    y = "Number of DEGs",
+    title = "Shoot DEGs"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title.y = element_text(face = "bold", size = 11),
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+## 2.5 DEG overlap among Nitrogen, CO2, and Line
+
+```{r deg-venn-n-c-l, fig.width=7, fig.height=6}
+# Select the three main-effect DEG sets (excluding interaction terms)
+find_main_effect <- function(candidates, label) {
+  matched <- intersect(candidates, names(all_deg_tables))
+  if (length(matched) != 1L) {
+    stop(
+      "Expected one ", label, " coefficient; found: ",
+      ifelse(length(matched) == 0L, "none", paste(matched, collapse = ", "))
+    )
+  }
+  matched
+}
+
+n_coef <- find_main_effect(c("Nitrogen"), "Nitrogen")
+c_coef <- find_main_effect(c("CO2_EC_vs_AC", "CO2EC"), "CO2")
+l_coef <- find_main_effect(c("Line_sunn_vs_A17", "Linesunn"), "Line")
+
+main_effect_sets <- setNames(
+  lapply(c(n_coef, c_coef, l_coef), \(x) unique(na.omit(all_deg_tables[[x]]$gene))),
+  c("Nitrogen", "CO2", "Line")
+)
+N <- main_effect_sets$Nitrogen
+C <- main_effect_sets$CO2
+L <- main_effect_sets$Line
+
+venn_counts <- c(
+  length(setdiff(N, union(C, L))),
+  length(setdiff(C, union(N, L))),
+  length(setdiff(L, union(N, C))),
+  length(setdiff(intersect(N, C), L)),
+  length(setdiff(intersect(N, L), C)),
+  length(setdiff(intersect(C, L), N)),
+  length(Reduce(intersect, main_effect_sets))
+)
+
+old_par <- par(mar = c(1, 1, 3, 1))
+plot.new()
+plot.window(xlim = c(-1.8, 1.8), ylim = c(-1.75, 1.6), asp = 1)
+venn_colors <- c("#66A61E", "#1F78B4", "#E66101")
+symbols(
+  c(-0.55, 0.55, 0), c(0.25, 0.25, -0.5),
+  circles = rep(1, 3), inches = FALSE, add = TRUE,
+  bg = grDevices::adjustcolor(venn_colors, alpha.f = 0.38),
+  fg = venn_colors, lwd = 2
+)
+text(
+  c(-0.95, 0.95, 0, 0, -0.5, 0.5, 0),
+  c(0.55, 0.55, -1.05, 0.72, -0.35, -0.35, 0.02),
+  venn_counts, cex = c(rep(1.2, 6), 1.25), font = c(rep(1, 6), 2)
+)
+text(
+  c(-1.15, 1.15, 0), c(1.3, 1.3, -1.58),
+  paste0(names(main_effect_sets), "\n(n = ", lengths(main_effect_sets), ")"),
+  font = 2
+)
+title("Shoot DEGs")
+box()
+par(old_par)
+
+# Save genes shared by at least two Venn sets
+all_genes <- Reduce(union, main_effect_sets)
+intersection_summary <- tibble(
+  gene = all_genes,
+  In_Nitrogen = all_genes %in% N,
+  In_CO2 = all_genes %in% C,
+  In_Line = all_genes %in% L
+) %>%
+  filter(In_Nitrogen + In_CO2 + In_Line >= 2L) %>%
+  mutate(
+    Intersection = case_when(
+      In_Nitrogen & In_CO2 & In_Line ~ "Nitrogen & CO2 & Line",
+      In_Nitrogen & In_CO2 ~ "Nitrogen & CO2",
+      In_Nitrogen & In_Line ~ "Nitrogen & Line",
+      TRUE ~ "CO2 & Line"
+    ),
+    .before = 1
+  )
+
+effect_statistics <- bind_rows(
+  all_deg_tables[[n_coef]] %>%
+    transmute(gene, Effect = "Nitrogen", log2FoldChange, padj),
+  all_deg_tables[[c_coef]] %>%
+    transmute(gene, Effect = "CO2", log2FoldChange, padj),
+  all_deg_tables[[l_coef]] %>%
+    transmute(gene, Effect = "Line", log2FoldChange, padj)
+) %>%
+  filter(gene %in% intersection_summary$gene) %>%
+  tidyr::pivot_wider(
+    names_from = Effect,
+    values_from = c(log2FoldChange, padj),
+    names_glue = "{Effect}_{.value}"
+  )
+
+intersection_summary <- intersection_summary %>%
+  dplyr::left_join(
+    gene_names,
+    by = "gene"
+  ) %>%
+  dplyr::mutate(
+    gene_name = dplyr::coalesce(gene_name, ""),
+    gene_product = dplyr::coalesce(gene_product, "")
+  ) %>%
+  dplyr::left_join(effect_statistics, by = "gene") %>%
+  dplyr::arrange(Intersection, gene)
+
+readr::write_csv(
+  intersection_summary,
+  file.path(
+    out_dir,
+    "DEG_Nitrogen_CO2_Line_intersections_summary.csv"
+  )
+)
+```
+
+### Direction-aware UpSet plot
+
+The Venn diagram above combines all significant DEGs regardless of direction.
+This plot separates up- and downregulated genes for each effect. `Not_DEG`
+means that the gene does not meet the adjusted-P-value threshold for that main
+effect.
+
+```{r deg-upset-n-c-l, fig.width=13, fig.height=8}
+effect_coefs <- c(Nitrogen = n_coef, CO2 = c_coef, Line = l_coef)
+directional_sets <- list()
+
+for (effect in names(effect_coefs)) {
+  tbl <- all_deg_tables[[effect_coefs[[effect]]]]
+  valid <- !is.na(tbl$gene) & !is.na(tbl$log2FoldChange)
+  directional_sets[[paste0(effect, "_up")]] <-
+    unique(tbl$gene[valid & tbl$log2FoldChange > 0])
+  directional_sets[[paste0(effect, "_down")]] <-
+    unique(tbl$gene[valid & tbl$log2FoldChange < 0])
+}
+
+directional_set_names <- names(directional_sets)
+upset_genes <- Reduce(union, directional_sets)
+if (length(upset_genes) == 0L) {
+  stop("No significant main-effect DEGs are available for the UpSet plot.")
+}
+
+upset_membership <- tibble::tibble(gene = upset_genes)
+for (set_name in directional_set_names) {
+  upset_membership[[set_name]] <-
+    upset_membership$gene %in% directional_sets[[set_name]]
+}
+
+direction_label <- function(up, down) {
+  ifelse(up, "Up", ifelse(down, "Down", "Not_DEG"))
+}
+
+upset_membership <- upset_membership %>%
+  dplyr::mutate(
+    Nitrogen_direction = direction_label(Nitrogen_up, Nitrogen_down),
+    CO2_direction = direction_label(CO2_up, CO2_down),
+    Line_direction = direction_label(Line_up, Line_down),
+    Direction_pattern = paste0(
+      "Nitrogen=", Nitrogen_direction,
+      "; CO2=", CO2_direction,
+      "; Line=", Line_direction
+    )
+  )
+
+# Count exact observed membership patterns and order them by abundance.
+upset_pattern_plot_data <- upset_membership %>%
+  dplyr::count(
+    dplyr::across(dplyr::all_of(directional_set_names)),
+    name = "n_genes",
+    sort = TRUE
+  )
+upset_pattern_matrix <- as.matrix(
+  upset_pattern_plot_data[directional_set_names]
+)
+set_sizes <- colSums(upset_membership[directional_set_names])
+
+# Draw a dependency-free UpSet layout. Set sizes are shown beside row labels.
+old_mfrow <- par("mfrow")
+old_mar <- par("mar")
+layout(matrix(c(1, 2), ncol = 1), heights = c(2.2, 1.25))
+
+par(mar = c(0.5, 11, 3.5, 1))
+bar_midpoints <- barplot(
+  upset_pattern_plot_data$n_genes,
+  names.arg = rep("", nrow(upset_pattern_plot_data)),
+  axes = FALSE,
+  col = "#4D4D4D",
+  border = NA,
+  ylab = "Intersection size"
+)
+axis(2, las = 1)
+text(
+  bar_midpoints,
+  upset_pattern_plot_data$n_genes,
+  labels = upset_pattern_plot_data$n_genes,
+  pos = 3,
+  xpd = NA,
+  cex = 0.8
+)
+title(main = "Shoot DEG intersections")
+mtext(
+  "Main-effect DEGs, adjusted P < 0.05",
+  side = 3,
+  line = 0.25,
+  cex = 0.85
+)
+
+par(mar = c(2, 11, 0.5, 1))
+set_y <- rev(seq_along(directional_set_names))
+plot(
+  NA,
+  xlim = range(bar_midpoints) + c(-0.6, 0.6),
+  ylim = range(set_y) + c(-0.5, 0.5),
+  xaxs = "i",
+  yaxs = "i",
+  axes = FALSE,
+  xlab = "",
+  ylab = ""
+)
+axis(
+  2,
+  at = set_y,
+  labels = paste0(
+    gsub("_", " ", directional_set_names, fixed = TRUE),
+    " (n = ", set_sizes, ")"
+  ),
+  las = 1,
+  tick = FALSE
+)
+abline(h = set_y, col = "#EEEEEE", lwd = 1)
+
+for (i in seq_len(nrow(upset_pattern_matrix))) {
+  points(
+    rep(bar_midpoints[i], length(set_y)),
+    set_y,
+    pch = 16,
+    col = "#D9D9D9",
+    cex = 1.05
+  )
+  active_rows <- which(upset_pattern_matrix[i, ])
+  if (length(active_rows) > 1L) {
+    segments(
+      bar_midpoints[i], min(set_y[active_rows]),
+      bar_midpoints[i], max(set_y[active_rows]),
+      col = "#222222",
+      lwd = 2
+    )
+  }
+  points(
+    rep(bar_midpoints[i], length(active_rows)),
+    set_y[active_rows],
+    pch = 16,
+    col = "#222222",
+    cex = 1.1
+  )
+}
+box()
+
+layout(matrix(1))
+par(mfrow = old_mfrow, mar = old_mar)
+
+upset_effect_statistics <- lapply(names(effect_coefs), function(effect) {
+  DESeq2::results(dds, name = effect_coefs[[effect]]) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("gene") %>%
+    dplyr::transmute(
+      gene,
+      Effect = .env$effect,
+      log2FoldChange,
+      padj
+    )
+}) %>%
+  dplyr::bind_rows() %>%
+  dplyr::filter(gene %in% upset_genes) %>%
+  tidyr::pivot_wider(
+    names_from = Effect,
+    values_from = c(log2FoldChange, padj),
+    names_glue = "{Effect}_{.value}"
+  )
+
+upset_summary <- upset_membership %>%
+  dplyr::left_join(gene_names, by = "gene") %>%
+  dplyr::mutate(
+    gene_name = dplyr::coalesce(gene_name, ""),
+    gene_product = dplyr::coalesce(gene_product, "")
+  ) %>%
+  dplyr::left_join(upset_effect_statistics, by = "gene") %>%
+  dplyr::relocate(
+    Direction_pattern,
+    Nitrogen_direction, CO2_direction, Line_direction,
+    .after = gene
+  ) %>%
+  dplyr::arrange(Direction_pattern, gene)
+
+readr::write_csv(
+  upset_summary,
+  file.path(
+    out_dir,
+    "DEG_Nitrogen_CO2_Line_direction_patterns.csv"
+  )
+)
+```
+
+## 2.6 topGO enrichment for Line DEGs
+
+Biological-process enrichment is run separately for upregulated and
+downregulated Line DEGs.
+
+```{r topgo-model-terms}
+if (!requireNamespace("topGO", quietly = TRUE)) {
+  stop(
+    "Package 'topGO' is required. Install it with ",
+    "BiocManager::install('topGO')."
+  )
+}
+if (!requireNamespace("GO.db", quietly = TRUE)) {
+  stop(
+    "Package 'GO.db' is required. Install it with ",
+    "BiocManager::install('GO.db')."
+  )
+}
+
+# topGO looks up ontology term objects such as GOBPTerm on the search path.
+suppressPackageStartupMessages({
+  library(topGO)
+  library(GO.db)
+})
+
+go_pairs_file <- here(
+  "MT_genome", "annotation", "GO_gene_pairs_MtrunA17r5.tsv"
+)
+if (!file.exists(go_pairs_file)) {
+  stop("GO annotation file not found: ", go_pairs_file)
+}
+
+go_pairs <- readr::read_tsv(
+  go_pairs_file,
+  col_types = readr::cols(.default = readr::col_character()),
+  show_col_types = FALSE
+) %>%
+  dplyr::transmute(gene = LOCUS_TAG, go = GO) %>%
+  dplyr::filter(
+    !is.na(gene), gene != "",
+    !is.na(go), go != ""
+  ) %>%
+  dplyr::distinct(gene, go)
+
+GO2genes <- split(go_pairs$gene, go_pairs$go)
+go_universe <- intersect(rownames(dds), unique(go_pairs$gene))
+
+topgo_coefs <- l_coef
+
+topgo_dir <- file.path(out_dir, "topGO_model_terms")
+dir.create(topgo_dir, recursive = TRUE, showWarnings = FALSE)
+
+parse_topgo_p <- function(x) {
+  x <- as.character(x)
+  ifelse(
+    grepl("^<", x),
+    suppressWarnings(as.numeric(sub("^<", "", x))),
+    suppressWarnings(as.numeric(x))
+  )
+}
+
+empty_topgo_result <- function(coef, direction, query_n) {
+  tibble::tibble(
+    coefficient = coef,
+    direction = direction,
+    QueryGeneN = query_n,
+    GO.ID = character(),
+    Term = character(),
+    Annotated = integer(),
+    Significant = integer(),
+    Expected = numeric(),
+    Fisher = character(),
+    Fisher_pvalue = numeric(),
+    padj = numeric(),
+    FoldEnrichment = numeric()
+  )
+}
+
+run_model_term_topgo <- function(coef, direction) {
+  deg_table <- all_deg_tables[[coef]]
+  if (is.null(deg_table)) {
+    stop("No DEG table found for coefficient: ", coef)
+  }
+
+  query_genes <- deg_table %>%
+    dplyr::filter(
+      if (direction == "up") log2FoldChange > 0 else log2FoldChange < 0
+    ) %>%
+    dplyr::pull(gene) %>%
+    unique() %>%
+    intersect(go_universe)
+
+  safe_coef <- gsub("[^A-Za-z0-9_]", "_", coef)
+  output_prefix <- paste0(safe_coef, "_", direction, "_topGO_BP")
+
+  if (length(query_genes) == 0L) {
+    result_table <- empty_topgo_result(coef, direction, 0L)
+    readr::write_csv(
+      result_table,
+      file.path(topgo_dir, paste0(output_prefix, ".csv"))
+    )
+    message(coef, " ", direction, ": no GO-annotated DEGs; skipped.")
+    return(result_table)
+  }
+
+  gene_list <- stats::setNames(
+    as.integer(go_universe %in% query_genes),
+    go_universe
+  )
+
+  GOdata <- methods::new(
+    "topGOdata",
+    ontology = "BP",
+    allGenes = gene_list,
+    geneSel = function(x) x == 1L,
+    annot = topGO::annFUN.GO2genes,
+    GO2genes = GO2genes,
+    nodeSize = 5
+  )
+
+  fisher_result <- topGO::runTest(
+    GOdata,
+    algorithm = "weight01",
+    statistic = "fisher"
+  )
+
+  n_terms <- length(topGO::score(fisher_result))
+  result_table <- topGO::GenTable(
+    GOdata,
+    Fisher = fisher_result,
+    orderBy = "Fisher",
+    ranksOf = "Fisher",
+    topNodes = n_terms,
+    numChar = 200
+  ) %>%
+    dplyr::mutate(
+      coefficient = coef,
+      direction = direction,
+      QueryGeneN = length(query_genes),
+      Fisher_pvalue = parse_topgo_p(Fisher),
+      padj = stats::p.adjust(Fisher_pvalue, method = "BH"),
+      Significant_num = suppressWarnings(as.numeric(Significant)),
+      Expected_num = suppressWarnings(as.numeric(Expected)),
+      FoldEnrichment = dplyr::if_else(
+        !is.na(Expected_num) & Expected_num > 0,
+        Significant_num / Expected_num,
+        NA_real_
+      )
+    ) %>%
+    dplyr::select(
+      coefficient, direction, QueryGeneN, GO.ID, Term,
+      Annotated, Significant, Expected, Fisher,
+      Fisher_pvalue, padj, FoldEnrichment
+    ) %>%
+    dplyr::arrange(Fisher_pvalue)
+
+  significant_table <- result_table %>%
+    dplyr::filter(!is.na(padj), padj < 0.05)
+
+  readr::write_csv(
+    result_table,
+    file.path(topgo_dir, paste0(output_prefix, ".csv"))
+  )
+  readr::write_csv(
+    significant_table,
+    file.path(topgo_dir, paste0(output_prefix, "_significant.csv"))
+  )
+
+  message(
+    coef, " ", direction, ": ", length(query_genes),
+    " GO-annotated DEGs; ", nrow(significant_table),
+    " BP terms with padj < 0.05."
+  )
+  result_table
+}
+
+model_term_topgo_results <- list()
+for (coef in topgo_coefs) {
+  model_term_topgo_results[[coef]] <- list(
+    up = run_model_term_topgo(coef, "up"),
+    down = run_model_term_topgo(coef, "down")
+  )
+}
+
+all_model_term_topgo <- dplyr::bind_rows(lapply(
+  model_term_topgo_results,
+  function(x) dplyr::bind_rows(x$up, x$down)
+))
+
+readr::write_csv(
+  all_model_term_topgo,
+  file.path(topgo_dir, "Line_up_down_topGO_BP.csv")
+)
+saveRDS(
+  model_term_topgo_results,
+  file.path(topgo_dir, "Line_up_down_topGO_BP_results.rds")
+)
+```
+
+## 2.7 Individual lollipop plots of selected significant GO terms
+
+```{r topgo-lollipop-plots, fig.width=9, fig.height=8}
+if (!requireNamespace("ggtext", quietly = TRUE)) {
+  stop("Package 'ggtext' is required. Install it with install.packages('ggtext').")
+}
+
+line_coef <- l_coef
+
+bubble_specs <- list(
+  list(coef = line_coef, direction = "up", label = "Line contrast: up"),
+  list(coef = line_coef, direction = "down", label = "Line contrast: down")
+)
+
+bp_class_ids <- list(
+  "Nitrogen assimilation" = c("GO:0042128", "GO:0019676", "GO:0006537"),
+  "Nitrogen-starvation response" = "GO:0006995",
+  "Defense response" = "GO:0006952",
+  "Autophagy" = "GO:0006914",
+  "Ubiquitination" = "GO:0016567",
+  "Protein phosphorylation" = "GO:0006468",
+  "Signal transduction" = "GO:0007165",
+  "Translation" = "GO:0006412",
+  "rRNA processing" = "GO:0006364",
+  "Ribosome biogenesis" = "GO:0042254",
+  "RNA modification" = "GO:0009451",
+  "Protein folding" = "GO:0006457",
+  "Protein targeting" = "GO:0006605",
+  "DNA replication" = "GO:0006260",
+  "DNA repair" = "GO:0006281"
+)
+
+bp_class_colors <- c(
+  "Nitrogen assimilation" = "#2CA25F",
+  "Nitrogen-starvation response" = "#99D8C9",
+  "Defense response" = "#D73027",
+  "Autophagy" = "#FC8D59",
+  "Ubiquitination" = "#E78AC3",
+  "Protein phosphorylation" = "#8E44AD",
+  "Signal transduction" = "#756BB1",
+  "Translation" = "#1F78B4",
+  "rRNA processing" = "#6BAED6",
+  "Ribosome biogenesis" = "#9ECAE1",
+  "RNA modification" = "#00A6A6",
+  "Protein folding" = "#E6AB02",
+  "Protein targeting" = "#A6761D",
+  "DNA replication" = "#F768A1",
+  "DNA repair" = "#AE017E",
+  "Other BP" = "#BDBDBD"
+)
+
+bp_ancestor_map <- as.list(GO.db::GOBPANCESTOR)
+
+classify_bp_term <- function(go_id) {
+  ancestors <- unique(c(go_id, bp_ancestor_map[[go_id]]))
+  matched_classes <- names(bp_class_ids)[vapply(
+    bp_class_ids,
+    function(class_ids) any(class_ids %in% ancestors),
+    logical(1)
+  )]
+  if (length(matched_classes) == 0L) {
+    "Other BP"
+  } else {
+    matched_classes[1]
+  }
+}
+
+plot_topgo_lollipop <- function(coef, direction, label) {
+  eligible_terms <- all_model_term_topgo %>%
+    dplyr::filter(
+      .data$coefficient == .env$coef,
+      .data$direction == .env$direction,
+      !is.na(Fisher_pvalue),
+      !is.na(padj),
+      padj < 0.05,
+      !is.na(FoldEnrichment),
+      FoldEnrichment > 0
+    ) %>%
+    dplyr::arrange(padj, Fisher_pvalue)
+
+  plot_data <- eligible_terms %>%
+    dplyr::slice_head(n = 20)
+
+  plot_data <- plot_data %>%
+    dplyr::mutate(
+      Significant_num = suppressWarnings(as.numeric(Significant)),
+      minus_log10_padj = -log10(pmax(padj, .Machine$double.xmin)),
+      BroadClass = factor(
+        vapply(GO.ID, classify_bp_term, character(1)),
+        levels = c(names(bp_class_ids), "Other BP")
+      )
+    ) %>%
+    dplyr::arrange(BroadClass, padj, Fisher_pvalue) %>%
+    dplyr::mutate(
+      GO.ID = factor(GO.ID, levels = rev(unique(GO.ID)))
+    )
+
+  axis_key <- plot_data %>%
+    dplyr::transmute(
+      go_id = as.character(GO.ID),
+      axis_label = paste0(
+        "<b><span style='color:",
+        bp_class_colors[as.character(BroadClass)],
+        "'>", go_id, "</span></b>"
+      )
+    )
+  axis_labels <- stats::setNames(axis_key$axis_label, axis_key$go_id)
+
+  if (nrow(plot_data) == 0L) {
+    message(label, ": no GO terms available for plotting.")
+    return(NULL)
+  }
+
+  p <- ggplot(
+    plot_data,
+    aes(
+      x = FoldEnrichment,
+      y = GO.ID,
+      size = Significant_num,
+      color = minus_log10_padj
+    )
+  ) +
+    geom_segment(
+      data = plot_data,
+      aes(x = 0, xend = FoldEnrichment, y = GO.ID, yend = GO.ID),
+      color = "grey70",
+      linewidth = 0.6,
+      inherit.aes = FALSE
+    ) +
+    geom_point(
+      data = plot_data,
+      aes(x = Inf, y = GO.ID, fill = BroadClass),
+      shape = 22,
+      alpha = 0,
+      inherit.aes = FALSE
+    ) +
+    geom_point(alpha = 0.9) +
+    scale_y_discrete(labels = axis_labels) +
+    scale_color_gradientn(
+      colours = c("#FDE725", "#90D743", "#35B779", "#31688E", "#440154"),
+      name = expression(-log[10]("adjusted p")),
+      guide = guide_colorbar(direction = "vertical")
+    ) +
+    scale_fill_manual(
+      values = bp_class_colors,
+      name = "GO functional class"
+    ) +
+    scale_size_continuous(name = "DEGs in GO term", range = c(2, 9)) +
+    labs(
+      title = paste0(label, " — topGO BP"),
+      x = "Fold enrichment",
+      y = NULL
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.y = ggtext::element_markdown(size = 9),
+      panel.grid = element_blank()
+    ) +
+    guides(
+      color = guide_colorbar(
+        direction = "vertical",
+        position = "right"
+      ),
+      fill = guide_legend(
+        override.aes = list(alpha = 1, shape = 22, size = 4),
+        position = "right",
+        ncol = 1
+      ),
+      size = guide_legend(position = "bottom")
+    )
+
+  safe_label <- gsub("[^A-Za-z0-9]+", "_", tolower(label))
+  readr::write_csv(
+    plot_data %>%
+      dplyr::mutate(GO.ID = as.character(GO.ID)) %>%
+      dplyr::select(GO.ID, Term, BroadClass, padj, FoldEnrichment, Significant),
+    file.path(topgo_dir, paste0(safe_label, "_topGO_BP_plot_key.csv"))
+  )
+  print(p)
+  p
+}
+
+selected_topgo_lollipop_plots <- lapply(
+  bubble_specs,
+  function(x) plot_topgo_lollipop(x$coef, x$direction, x$label)
+)
+```

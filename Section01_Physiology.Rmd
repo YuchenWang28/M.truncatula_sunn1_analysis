@@ -1,0 +1,635 @@
+---
+title: "Section01_Physiology"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(here)
+```
+
+## Load and subset physiology data
+
+```{r load-and-subset}
+# Read the publication-ready physiology dataset
+A17_sunn_phys <- read.csv(
+  here("Data", "data_for_publication", "Trait_A17_sunn.csv")
+)
+
+# Subset to A17 and sunn lines only
+A17_sunn_phys <- A17_sunn_phys[
+  A17_sunn_phys$Line %in% c("A17", "sunn"),
+]
+```
+
+```{r function-for-boxplot-with-tukey-threeway}
+library(dplyr)
+library(ggplot2)
+library(rlang)
+
+plot_trait_box_tukey_threeway <- function(data,
+                                          trait,
+                                          nitrogen_levels = c(5, 20),
+                                          ylab = NULL,
+                                          remove_outliers = FALSE,
+                                          outlier_coef = 1.5) {
+  trait_quo <- rlang::ensym(trait)
+  trait_chr <- rlang::as_string(trait_quo)
+  line_facet_labeller <- as_labeller(
+    c(A17 = "bold('A17')", sunn = "italic('sunn-1')"),
+    default = label_parsed
+  )
+
+  df <- data %>%
+    filter(!is.na(!!trait_quo)) %>%
+    mutate(
+      Nitrogen_mM = as.numeric(as.character(Nitrogen)),
+      Nitrogen_f = factor(Nitrogen_mM, levels = nitrogen_levels),
+      Line = factor(Line),
+      CO2 = factor(CO2, levels = c("AC", "EC"))
+    ) %>%
+    filter(
+      Nitrogen_mM %in% nitrogen_levels,
+      is.finite(.data[[trait_chr]]),
+      !is.na(Nitrogen_f),
+      !is.na(Line),
+      !is.na(CO2)
+    ) %>%
+    mutate(Treatment = interaction(Line, Nitrogen_f, CO2, sep = "_", drop = TRUE))
+
+  if (is.null(ylab)) ylab <- trait_chr
+  nitrogen_label <- paste(format(nitrogen_levels, trim = TRUE, drop0trailing = TRUE), collapse = ", ")
+
+  if (remove_outliers) {
+    n_before <- nrow(df)
+
+    df <- df %>%
+      group_by(Line, CO2, Nitrogen_f) %>%
+      mutate(
+        Q1 = quantile(.data[[trait_chr]], 0.25, na.rm = TRUE),
+        Q3 = quantile(.data[[trait_chr]], 0.75, na.rm = TRUE),
+        IQR_val = IQR(.data[[trait_chr]], na.rm = TRUE)
+      ) %>%
+      filter(
+        .data[[trait_chr]] >= Q1 - outlier_coef * IQR_val,
+        .data[[trait_chr]] <= Q3 + outlier_coef * IQR_val
+      ) %>%
+      dplyr::select(-Q1, -Q3, -IQR_val) %>%
+      ungroup()
+
+    cat("\n## ", ylab, " outlier removal - removed ", n_before - nrow(df), " samples by ",
+        outlier_coef, " x IQR within Line x CO2 x Nitrogen\n\n", sep = "")
+  }
+
+  y_range <- range(df[[trait_chr]], na.rm = TRUE)
+  y_offset <- if (diff(y_range) == 0) max(abs(y_range), 1) * 0.08 else diff(y_range) * 0.08
+  letter_data <- NULL
+
+  if (nrow(df) >= 3L && dplyr::n_distinct(df$Treatment) > 1L) {
+    cat("\n## ", ylab, " ANOVA - Line x N (numeric) x CO2 (N = ", nitrogen_label, ")\n\n", sep = "")
+    fit_full <- aov(
+      stats::reformulate("Line * Nitrogen_mM * CO2", response = trait_chr),
+      data = df
+    )
+    print(summary(fit_full))
+
+    cat("\n## ", ylab, " Tukey HSD - Line x Nitrogen x CO2 (three-way)\n\n", sep = "")
+    fit_factor <- aov(
+      stats::reformulate("Line * Nitrogen_f * CO2", response = trait_chr),
+      data = df
+    )
+    fit_treatment <- aov(
+      stats::reformulate("Treatment", response = trait_chr),
+      data = df
+    )
+    print(TukeyHSD(fit_treatment))
+
+    if (requireNamespace("emmeans", quietly = TRUE) && requireNamespace("multcomp", quietly = TRUE)) {
+      cat("\n## ", ylab, " Tukey letters - Line x Nitrogen x CO2 (three-way)\n\n", sep = "")
+      emm_threeway <- emmeans::emmeans(fit_factor, ~ Line * Nitrogen_f * CO2)
+      print(pairs(emm_threeway, adjust = "tukey"))
+
+      y_pos <- df %>%
+        group_by(Line, Nitrogen_f, CO2) %>%
+        summarise(y_letter = max(.data[[trait_chr]], na.rm = TRUE) + y_offset, .groups = "drop")
+
+      # Capture levels outside mutate(): emmeans tables include a `df` column.
+      nitrogen_levels_f <- levels(df$Nitrogen_f)
+      co2_levels_f <- levels(df$CO2)
+      line_levels_f <- levels(df$Line)
+
+      letter_data <- multcomp::cld(emm_threeway, Letters = letters, adjust = "tukey") %>%
+        as.data.frame() %>%
+        mutate(
+          .group = gsub("\\s+", "", .group),
+          Nitrogen_f = factor(as.character(Nitrogen_f), levels = nitrogen_levels_f),
+          CO2 = factor(as.character(CO2), levels = co2_levels_f),
+          Line = factor(as.character(Line), levels = line_levels_f)
+        ) %>%
+        dplyr::select(Line, Nitrogen_f, CO2, .group) %>%
+        left_join(y_pos, by = c("Line", "Nitrogen_f", "CO2"))
+      print(letter_data)
+    } else {
+      cat("\n## ", ylab, " Tukey letters skipped - install emmeans and multcomp\n\n", sep = "")
+    }
+  } else {
+    cat("\n## ", ylab, " Tukey HSD skipped - insufficient treatment groups\n\n", sep = "")
+  }
+
+  p <- ggplot(df, aes(x = Nitrogen_f, y = !!trait_quo, fill = CO2)) +
+    geom_boxplot(width = 0.65, outlier.shape = NA, alpha = 0.75) +
+    geom_point(
+      aes(color = CO2),
+      position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.75),
+      size = 1.8,
+      alpha = 0.8,
+      show.legend = FALSE
+    ) +
+    facet_wrap(vars(Line), labeller = line_facet_labeller) +
+    scale_fill_manual(
+      name = expression(CO[2]),
+      values = c(AC = "cadetblue2", EC = "cadetblue4")
+    ) +
+    scale_color_manual(
+      name = expression(CO[2]),
+      values = c(AC = "cadetblue2", EC = "cadetblue4")
+    ) +
+    labs(x = "Nitrogen (mM)", y = ylab) +
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      strip.text = element_text(face = "plain"),
+      panel.border = element_blank(),
+      panel.spacing.x = grid::unit(0, "pt"),
+      panel.grid.major = element_line(color = "grey92", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+
+  line_levels <- levels(droplevels(df$Line))
+  left_facet <- data.frame(
+    Line = factor(line_levels[1], levels = line_levels)
+  )
+  right_facet <- data.frame(
+    Line = factor(line_levels[length(line_levels)], levels = line_levels)
+  )
+
+  p <- p +
+    geom_hline(
+      yintercept = c(-Inf, Inf),
+      color = "black",
+      linewidth = 0.7
+    ) +
+    geom_vline(
+      data = left_facet,
+      xintercept = -Inf,
+      color = "black",
+      linewidth = 0.7,
+      inherit.aes = FALSE
+    ) +
+    geom_vline(
+      data = right_facet,
+      xintercept = Inf,
+      color = "black",
+      linewidth = 0.7,
+      inherit.aes = FALSE
+    )
+
+  if (!is.null(letter_data)) {
+    p <- p +
+      geom_text(
+        data = letter_data,
+        aes(x = Nitrogen_f, y = y_letter, label = .group, group = CO2),
+        position = position_dodge(width = 0.75),
+        vjust = 0,
+        size = 4,
+        inherit.aes = FALSE
+      ) +
+      expand_limits(y = max(letter_data$y_letter, na.rm = TRUE) + y_offset)
+  }
+
+  return(p)
+}
+```
+
+## Physiological trait plots
+
+```{r plot-physiological-traits, fig.width=8, fig.height=5}
+nodule_count_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys,
+  trait = NodCount,
+  nitrogen_levels = c(2.5, 10, 20),
+  ylab = "Nodule Count"
+)
+
+print(nodule_count_box_n_2_5_10_20)
+
+shoot_biomass_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys,
+  trait = ShootBiomass_mg,
+  nitrogen_levels = c(2.5, 10, 20),
+  ylab = "Shoot Biomass (mg)",
+  remove_outliers = FALSE
+)
+
+print(shoot_biomass_box_n_2_5_10_20)
+
+root_biomass_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys,
+  trait = RootBiomass_mg,
+  nitrogen_levels = c(2.5, 10, 20),
+  ylab = "Root Biomass (mg)",
+  remove_outliers = FALSE
+)
+
+print(root_biomass_box_n_2_5_10_20)
+
+nodule_biomass_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys,
+  trait = NoduleBiomass_mg,
+  nitrogen_levels = c(2.5, 10, 20),
+  ylab = "Nodule Biomass (mg)",
+  remove_outliers = TRUE
+)
+
+print(nodule_biomass_box_n_2_5_10_20)
+
+nodule_biomass_total_biomass_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys,
+  trait = NoduleBiomass_Totalbiomass,
+  nitrogen_levels = c(2.5,10, 20),
+  ylab = "Nodule Biomass / Total Biomass",
+  remove_outliers = FALSE
+)
+
+print(nodule_biomass_total_biomass_box_n_2_5_10_20)
+
+shoot_root_ratio_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys,
+  trait = ShootRoot_ratio,
+  nitrogen_levels = c(2.5, 10, 20),
+  ylab = "Shoot to Root Ratio",
+  remove_outliers = FALSE
+)
+
+print(shoot_root_ratio_box_n_2_5_10_20)
+
+total_biomass_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys,
+  trait = TotalBiomass_mg,
+  nitrogen_levels = c(2.5, 10, 20),
+  ylab = "Total Biomass (mg)",
+  remove_outliers = FALSE
+)
+
+print(total_biomass_box_n_2_5_10_20)
+
+total_shoot_n_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys,
+  trait = ShootTotalN_mg,
+  nitrogen_levels = c(2.5, 10, 20),
+  ylab = "Total N in Shoot (mg)",
+  remove_outliers = FALSE
+)
+
+print(total_shoot_n_box_n_2_5_10_20)
+
+CNratio_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys,
+  trait = ShootCN_ratio,
+  nitrogen_levels = c(2.5,10,20),
+  ylab = "Shoot C/N Ratio",
+  remove_outliers = TRUE
+)
+
+print(CNratio_box_n_2_5_10_20)
+
+QY_max_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys,
+  trait = QY_max,
+  nitrogen_levels = c(2.5, 5, 10, 20),
+  ylab = "Fv/Fm",
+  remove_outliers = TRUE
+)
+
+print(QY_max_box_n_2_5_10_20)
+
+spad_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys,
+  trait = SPAD,
+  nitrogen_levels = c(2.5, 10, 20),
+  ylab = "Chlorophyll Content (SPAD)",
+  remove_outliers = FALSE
+)
+
+print(spad_box_n_2_5_10_20)
+
+pct_ndfa_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys %>%
+    dplyr::filter(RNA.seq.id != "MTNC181"),
+  trait = Ndfa_pct,
+  nitrogen_levels = c(2.5,10,20),
+  ylab = "Shoot %Ndfa",
+  remove_outliers = FALSE
+)
+
+print(pct_ndfa_box_n_2_5_10_20)
+
+fixedN_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys %>%
+    dplyr::filter(RNA.seq.id != "MTNC181"),
+  trait = N_fixed_mg,
+  nitrogen_levels = c(2.5,5,10,20),
+  ylab = "Shoot Fixed N (mg)",
+  remove_outliers = FALSE
+)
+
+print(fixedN_box_n_2_5_10_20)
+
+soilN_box_n_2_5_10_20 <- plot_trait_box_tukey_threeway(
+  A17_sunn_phys %>%
+    dplyr::filter(RNA.seq.id != "MTNC181"),
+  trait = N_soil_uptake_mg,
+  nitrogen_levels = c(2.5,5,10,20),
+  ylab = "Shoot Soil N (mg)",
+  remove_outliers = FALSE
+)
+
+print(soilN_box_n_2_5_10_20)
+
+```
+
+## Trait correlations within each line
+
+Pearson correlations of Total Biomass, Shoot Total N, Nodule Count, Nodule Biomass, Shoot C/N Ratio, %Ndfa, Chlorophyll Content (SPAD), QY_max, Shoot Fixed N, and Shoot Soil N, calculated separately within A17 and within sunn.
+
+```{r trait-correlations-by-line, fig.width=10, fig.height=8}
+trait_cor_cols <- c(
+  "TotalBiomass_mg",
+  "ShootTotalN_mg",
+  "NodCount",
+  "NoduleBiomass_mg",
+  "ShootCN_ratio",
+  "Ndfa_pct",
+  "SPAD",
+  "QY_max",
+  "N_fixed_mg",
+  "N_soil_uptake_mg"
+)
+
+trait_cor_labels <- c(
+  TotalBiomass_mg = "Total Biomass",
+  ShootTotalN_mg = "Shoot Total N",
+  NodCount = "Nodule Count",
+  NoduleBiomass_mg = "Nodule Biomass",
+  ShootCN_ratio = "Shoot C/N Ratio",
+  Ndfa_pct = "%Ndfa",
+  SPAD = "Chlorophyll Content (SPAD)",
+  QY_max = "QY_max",
+  N_fixed_mg = "Shoot Fixed N",
+  N_soil_uptake_mg = "Shoot Soil N"
+)
+
+df_trait_cor <- A17_sunn_phys %>%
+  mutate(
+    Line = factor(Line, levels = c("A17", "sunn")),
+    CO2 = factor(CO2, levels = c("AC", "EC")),
+    Nitrogen_mM = as.numeric(as.character(Nitrogen))
+  ) %>%
+  filter(Line %in% c("A17", "sunn"), !is.na(CO2), !is.na(Nitrogen_mM))
+
+# Use one hierarchical clustering order across both line-specific panels.
+trait_cor_matrix <- stats::cor(
+  df_trait_cor[, trait_cor_cols],
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+trait_cor_matrix[!is.finite(trait_cor_matrix)] <- 0
+diag(trait_cor_matrix) <- 1
+
+trait_cluster_order <- trait_cor_cols[
+  stats::hclust(stats::as.dist(1 - trait_cor_matrix), method = "complete")$order
+]
+trait_cluster_label_order <- unname(trait_cor_labels[trait_cluster_order])
+
+calc_trait_cor <- function(data, traits, method = "pearson") {
+  pairs <- expand.grid(
+    trait_x = traits,
+    trait_y = traits,
+    stringsAsFactors = FALSE
+  ) %>%
+    filter(trait_x != trait_y)
+
+  cor_rows <- vector("list", nrow(pairs))
+
+  for (i in seq_len(nrow(pairs))) {
+    x_col <- pairs$trait_x[i]
+    y_col <- pairs$trait_y[i]
+    complete_idx <- stats::complete.cases(data[, c(x_col, y_col)])
+    n_pair <- sum(complete_idx)
+
+    if (
+      n_pair >= 3 &&
+      stats::sd(data[[x_col]][complete_idx], na.rm = TRUE) > 0 &&
+      stats::sd(data[[y_col]][complete_idx], na.rm = TRUE) > 0
+    ) {
+      cor_test <- suppressWarnings(stats::cor.test(
+        data[[x_col]][complete_idx],
+        data[[y_col]][complete_idx],
+        method = method,
+        exact = FALSE
+      ))
+      cor_rows[[i]] <- data.frame(
+        trait_x = x_col,
+        trait_y = y_col,
+        r = unname(cor_test$estimate),
+        p_value = cor_test$p.value,
+        n = n_pair,
+        stringsAsFactors = FALSE
+      )
+    } else {
+      cor_rows[[i]] <- data.frame(
+        trait_x = x_col,
+        trait_y = y_col,
+        r = NA_real_,
+        p_value = NA_real_,
+        n = n_pair,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  dplyr::bind_rows(cor_rows)
+}
+
+trait_cor_results <- df_trait_cor %>%
+  group_by(Line) %>%
+  group_modify(~ calc_trait_cor(.x, trait_cor_cols, method = "pearson")) %>%
+  ungroup() %>%
+  group_by(Line) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    significance = dplyr::case_when(
+      is.na(p_adj) ~ "Not tested",
+      p_adj < 0.05 ~ "FDR < 0.05",
+      TRUE ~ "NS"
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    trait_x_label = factor(
+      trait_cor_labels[trait_x],
+      levels = trait_cluster_label_order
+    ),
+    trait_y_label = factor(
+      trait_cor_labels[trait_y],
+      levels = rev(trait_cluster_label_order)
+    ),
+    cor_label = dplyr::case_when(
+      !is.na(p_adj) & p_adj < 0.001 ~ paste0(sprintf("%.2f", r), "\n***"),
+      !is.na(p_adj) & p_adj < 0.01 ~ paste0(sprintf("%.2f", r), "\n**"),
+      !is.na(p_adj) & p_adj < 0.05 ~ paste0(sprintf("%.2f", r), "\n*"),
+      TRUE ~ ""
+    )
+  )
+
+# Keep lower triangle only (unique pairs)
+trait_cor_plot <- trait_cor_results %>%
+  filter(
+    !is.na(r),
+    match(as.character(trait_y), trait_cluster_order) >
+      match(as.character(trait_x), trait_cluster_order)
+  )
+
+print(trait_cor_plot %>%
+  dplyr::select(Line, trait_x, trait_y, r, p_value, p_adj, n, significance))
+
+plot_trait_cor_line <- function(line_name, plot_title) {
+  ggplot(
+    trait_cor_plot %>% filter(as.character(Line) == line_name),
+    aes(x = trait_x_label, y = trait_y_label, fill = r)
+  ) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    geom_text(aes(label = cor_label), size = 2.3, color = "black") +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_discrete(drop = FALSE) +
+    scale_fill_gradient2(
+      name = "Pearson r",
+      low = "#5F8F9A",
+      mid = "grey98",
+      high = "burlywood3",
+      midpoint = 0,
+      limits = c(-1, 1)
+    ) +
+    labs(
+      x = NULL,
+      y = NULL,
+      title = plot_title
+    ) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid = element_blank(),
+      legend.position = "bottom"
+    )
+}
+
+trait_cor_A17_plot <- plot_trait_cor_line("A17", "A17 Trait Correlations")
+trait_cor_sunn_plot <- plot_trait_cor_line("sunn", "sunn-1 Trait Correlations")
+
+print(trait_cor_A17_plot)
+print(trait_cor_sunn_plot)
+```
+
+## Fv/Fm light-response curve
+
+```{r fvfm-light-curve, fig.width=9, fig.height=8}
+fvfm_light_long <- dplyr::bind_rows(lapply(seq_len(6), function(light_step) {
+  A17_sunn_phys %>%
+    dplyr::transmute(
+      Line,
+      CO2,
+      Nitrogen_mM = as.numeric(as.character(Nitrogen)),
+      LightStep = light_step,
+      PPFD = .data[[paste0("PAR", light_step)]],
+      Fv_Fm = .data[[paste0("Fv.Fm_Lss", light_step)]]
+    )
+})) %>%
+  dplyr::filter(
+    Line %in% c("A17", "sunn"),
+    Nitrogen_mM %in% c(2.5, 10, 20),
+    !is.na(PPFD),
+    !is.na(Fv_Fm)
+  )
+
+fvfm_light_summary <- fvfm_light_long %>%
+  dplyr::group_by(Line, CO2, Nitrogen_mM, LightStep) %>%
+  dplyr::summarise(
+    PPFD = mean(PPFD, na.rm = TRUE),
+    mean_Fv_Fm = mean(Fv_Fm, na.rm = TRUE),
+    n = dplyr::n(),
+    se_Fv_Fm = stats::sd(Fv_Fm, na.rm = TRUE) / sqrt(n),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    Line = factor(Line, levels = c("A17", "sunn")),
+    CO2 = factor(CO2, levels = c("AC", "EC")),
+    Nitrogen_mM = factor(Nitrogen_mM, levels = sort(unique(Nitrogen_mM)))
+  )
+
+fvfm_light_curve <- ggplot(
+  fvfm_light_summary,
+  aes(
+    x = PPFD,
+    y = mean_Fv_Fm,
+    color = Line,
+    group = Line
+  )
+) +
+  geom_vline(
+    xintercept = 200,
+    color = "orange",
+    linetype = "dashed",
+    linewidth = 0.8,
+    inherit.aes = FALSE
+  ) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(
+      ymin = mean_Fv_Fm - se_Fv_Fm,
+      ymax = mean_Fv_Fm + se_Fv_Fm
+    ),
+    width = 10,
+    linewidth = 0.45
+  ) +
+  facet_grid(
+    Nitrogen_mM ~ CO2,
+    labeller = labeller(
+      CO2 = c(AC = "Ambient CO2", EC = "Elevated CO2"),
+      Nitrogen_mM = label_both
+    )
+  ) +
+  scale_color_manual(
+    values = c(A17 = "#DEE757", sunn = "#F1B856"),
+    labels = c(A17 = "A17", sunn = "sunn-1")
+  ) +
+  labs(
+    x = expression(PPFD~(mu*mol~m^{-2}~s^{-1})),
+    y = "Fv'/Fm'",
+    color = "Line"
+  ) +
+  theme_bw() +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position = "top"
+  )
+
+print(fvfm_light_curve)
+```
