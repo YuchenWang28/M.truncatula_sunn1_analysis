@@ -1,0 +1,1620 @@
+---
+title: "Section04_GRNanalysis_Subnetworks"
+output: html_document
+---
+#Set Up
+```{r setup}
+library(dplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(here)
+
+grn_dir  <- here("Data", "data_for_publication", "GRN_analysis")
+out_dir  <- file.path(grn_dir, "subnetwork")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+consensus_filtered <- read_csv(
+  file.path(grn_dir, "consensus_network", "consensus_network_deg_tf_top3pct_edges.csv"),
+  show_col_types = FALSE
+)
+
+module_genes_df <- read_csv(
+  file.path(grn_dir, "selected_module_genes.csv"),
+  show_col_types = FALSE
+)
+
+tf_ortholog_file <- file.path(grn_dir, "AT_to_Mt5.0_TF_map.csv")
+tf_base_file     <- file.path(grn_dir, "Mt_TF_annotation.csv")
+
+tf_ortholog_map <- readr::read_csv(tf_ortholog_file, show_col_types = FALSE)
+tf_base_map     <- readr::read_csv(tf_base_file, show_col_types = FALSE)
+
+first_non_blank <- function(x) {
+  x <- trimws(as.character(x))
+  x <- x[!is.na(x) & x != "" & x != "NA"]
+  if (length(x) == 0) NA_character_ else x[[1]]
+}
+
+tf_gene_names <- readr::read_tsv(
+  here("MT_genome", "annotation", "MtrunA17r5.0-ANR-EGN-r1.9.gene_names.tsv"),
+  show_col_types = FALSE
+) %>%
+  dplyr::transmute(
+    regulatoryGene = trimws(locus_tag),
+    curated_name = dplyr::na_if(trimws(acronym), ""),
+    curated_product = dplyr::na_if(trimws(geneProduct), "")
+  ) %>%
+  dplyr::group_by(regulatoryGene) %>%
+  dplyr::summarise(
+    curated_name = first_non_blank(curated_name),
+    curated_product = first_non_blank(curated_product),
+    .groups = "drop"
+  )
+
+tf_genome_annotation <- readr::read_tsv(
+  here("MT_genome", "annotation", "MtrunA17r5.0-ANR-EGN-r1.9.summary.tsv"),
+  show_col_types = FALSE
+) %>%
+  dplyr::transmute(
+    regulatoryGene = trimws(LOCUS_TAG),
+    genome_name = dplyr::na_if(trimws(GN), ""),
+    genome_product = dplyr::na_if(trimws(PRODUCT), "")
+  ) %>%
+  dplyr::group_by(regulatoryGene) %>%
+  dplyr::summarise(
+    genome_name = first_non_blank(genome_name),
+    genome_product = first_non_blank(genome_product),
+    .groups = "drop"
+  )
+
+tf_base_annotation <- tf_base_map %>%
+  dplyr::transmute(
+    regulatoryGene = trimws(LOCUS_TAG),
+    base_product = dplyr::na_if(trimws(as.character(PRODUCT)), "")
+  ) %>%
+  dplyr::group_by(regulatoryGene) %>%
+  dplyr::summarise(
+    base_product = first_non_blank(base_product),
+    .groups = "drop"
+  )
+
+tf_gene_annotation <- tf_gene_names %>%
+  dplyr::full_join(tf_genome_annotation, by = "regulatoryGene") %>%
+  dplyr::full_join(tf_base_annotation, by = "regulatoryGene") %>%
+  dplyr::transmute(
+    regulatoryGene,
+    tf_acronym = dplyr::coalesce(curated_name, genome_name),
+    tf_product = dplyr::coalesce(curated_product, genome_product, base_product)
+  )
+
+```
+
+#Extracting subnetwork
+```{r build-tf-ranking-function}
+build_tf_ranking <- function(
+  module_names,
+  consensus_filtered,
+  module_genes_df,
+  out_dir,
+  output_label = NULL,
+  save_csv = TRUE
+) {
+  stopifnot(length(module_names) > 0)
+
+  selected_module_map <- module_genes_df %>%
+    dplyr::filter(module %in% module_names) %>%
+    dplyr::select(gene_id, module) %>%
+    dplyr::distinct()
+
+  subnetwork_targets <- unique(selected_module_map$gene_id)
+
+  consensus_subnetwork <- consensus_filtered %>%
+    dplyr::filter(
+      !is.na(regulatoryGene),
+      !is.na(targetGene),
+      targetGene %in% subnetwork_targets
+    ) %>%
+    dplyr::left_join(selected_module_map, by = c("targetGene" = "gene_id")) %>%
+    dplyr::left_join(tf_gene_annotation, by = "regulatoryGene")
+
+  cat("Subnetwork edges:", nrow(consensus_subnetwork), "\n")
+  cat("Subnetwork TFs:", dplyr::n_distinct(consensus_subnetwork$regulatoryGene), "\n")
+  cat("Subnetwork targets:", dplyr::n_distinct(consensus_subnetwork$targetGene), "\n")
+
+  tf_targets_top3 <- consensus_filtered %>%
+    dplyr::filter(!is.na(regulatoryGene), !is.na(targetGene)) %>%
+    dplyr::group_by(regulatoryGene) %>%
+    dplyr::summarise(
+      n_targets_top3 = dplyr::n_distinct(targetGene),
+      .groups = "drop"
+    )
+
+  tf_targets_sub <- consensus_subnetwork %>%
+    dplyr::group_by(regulatoryGene) %>%
+    dplyr::summarise(
+      n_targets_subnetwork = dplyr::n_distinct(targetGene),
+      median_geo_rank_subnetwork = median(GeoMeanRank, na.rm = TRUE),
+      target_genes_subnetwork = paste(sort(unique(targetGene)), collapse = ";"),
+      .groups = "drop"
+    )
+
+  tf_module_breakdown <- consensus_subnetwork %>%
+    dplyr::group_by(regulatoryGene, module) %>%
+    dplyr::summarise(
+      n_targets_in_module = dplyr::n_distinct(targetGene),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(regulatoryGene, module) %>%
+    dplyr::group_by(regulatoryGene) %>%
+    dplyr::summarise(
+      module_target_counts = paste0(module, "(", n_targets_in_module, ")", collapse = "; "),
+      .groups = "drop"
+    )
+
+  all_top3_targets <- consensus_filtered %>%
+    dplyr::filter(!is.na(targetGene)) %>%
+    dplyr::pull(targetGene) %>%
+    unique()
+
+  selected_targets_top3_n <- length(intersect(subnetwork_targets, all_top3_targets))
+  total_targets_top3 <- length(all_top3_targets)
+
+  if (total_targets_top3 == 0) {
+    stop("No targets found in consensus_filtered.")
+  }
+
+  background_fraction <- selected_targets_top3_n / total_targets_top3
+
+  cat("Total unique targets in full top3 network:", total_targets_top3, "\n")
+  cat("Selected-module targets present in full top3 network:", selected_targets_top3_n, "\n")
+  cat("Background fraction:", background_fraction, "\n")
+
+  if (!is.finite(background_fraction) || background_fraction <= 0) {
+    stop("background_fraction is invalid: ", background_fraction)
+  }
+
+  tf_rank <- tf_targets_sub %>%
+    dplyr::left_join(tf_targets_top3, by = "regulatoryGene") %>%
+    dplyr::left_join(tf_module_breakdown, by = "regulatoryGene") %>%
+    dplyr::mutate(
+      subnetwork_fraction = n_targets_subnetwork / n_targets_top3,
+      enrichment_ratio = subnetwork_fraction / background_fraction,
+      enrichment_p_value = stats::phyper(
+        q = n_targets_subnetwork - 1,
+        m = selected_targets_top3_n,
+        n = total_targets_top3 - selected_targets_top3_n,
+        k = n_targets_top3,
+        lower.tail = FALSE
+      ),
+      enrichment_p_adj = stats::p.adjust(enrichment_p_value, method = "BH")
+    ) %>%
+    dplyr::mutate(
+      subnetwork_fraction = dplyr::if_else(n_targets_top3 > 0, subnetwork_fraction, NA_real_),
+      enrichment_ratio = dplyr::if_else(n_targets_top3 > 0, enrichment_ratio, NA_real_),
+      enrichment_p_value = dplyr::if_else(n_targets_top3 > 0, enrichment_p_value, NA_real_)
+    ) %>%
+    dplyr::left_join(tf_gene_annotation, by = "regulatoryGene") %>%
+    dplyr::select(
+      regulatoryGene,
+      tf_acronym,
+      tf_product,
+      module_target_counts,
+      n_targets_subnetwork,
+      n_targets_top3,
+      subnetwork_fraction,
+      enrichment_ratio,
+      enrichment_p_adj,
+      median_geo_rank_subnetwork,
+      target_genes_subnetwork
+    ) %>%
+    dplyr::arrange(
+      enrichment_p_adj,
+      dplyr::desc(enrichment_ratio),
+      dplyr::desc(n_targets_subnetwork),
+      median_geo_rank_subnetwork
+    )
+
+  file_label <- if (!is.null(output_label) && output_label != "") {
+    output_label
+  } else {
+    paste(module_names, collapse = "_")
+  }
+
+  tf_rank_outfile <- file.path(out_dir, paste0("TF_ranked_subnetwork_", file_label, ".csv"))
+  subnetwork_outfile <- file.path(out_dir, paste0("subnetwork_edges_", file_label, ".csv"))
+
+  if (save_csv) {
+    readr::write_csv(tf_rank, tf_rank_outfile, na = "NA")
+    readr::write_csv(consensus_subnetwork, subnetwork_outfile, na = "NA")
+    cat("Saved TF ranking:", tf_rank_outfile, "\n")
+    cat("Saved subnetwork edges:", subnetwork_outfile, "\n")
+  }
+
+  invisible(list(
+    tf_table = tf_rank,
+    subnetwork = consensus_subnetwork,
+    tf_table_file = tf_rank_outfile,
+    subnetwork_file = subnetwork_outfile
+  ))
+}
+```
+
+target_modules <- c(
+  "green", "magenta", "midnightblue", "skyblue", "white", "black",
+  "red", "cyan", "turquoise", "lightcyan", "pink", "royalblue",
+  "darkgreen", "lightyellow", "brown"
+)
+
+```{r, run TF ranking for selected modules}
+selected_modules <- c("green")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "green"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("magenta")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "magenta"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("midnightblue")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "midnightblue"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("skyblue")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "skyblue"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("white")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "white"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("black")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "black"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("red")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "red"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("cyan")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "cyan"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("turquoise")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "turquoise"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("lightcyan")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "lightcyan"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("pink")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "pink"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("royalblue")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "royalblue"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("darkgreen")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "darkgreen"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("lightyellow")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "lightyellow"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+
+selected_modules <- c("brown")
+
+tf_rank_result <- build_tf_ranking(
+  module_names = selected_modules,
+  consensus_filtered = consensus_filtered,
+  module_genes_df = module_genes_df,
+  out_dir = out_dir,
+  output_label = "brown"
+)
+
+tf_rank_big <- tf_rank_result$tf_table
+```
+
+GRN_v1:  module_order <- c(
+  "royalblue","brown","skyblue","darkgreen","lightyellow","magenta",
+  "green","pink","saddlebrown","red","lightcyan","turquoise",
+  "white","black"
+)
+
+#Rerank the subnetwork and Summarize top TFs across modules
+```{r, load subnetworks}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(purrr)
+  library(tidyr)
+})
+
+subnetwork_dir <- file.path(grn_dir, "subnetwork")
+
+module_order <- c("green", "magenta", "midnightblue", "skyblue", "white", "black",
+  "red", "cyan", "turquoise", "lightcyan", "pink", "royalblue",
+  "darkgreen", "lightyellow", "brown"
+)
+
+tf_files <- file.path(
+  subnetwork_dir,
+  paste0("TF_ranked_subnetwork_", module_order, ".csv")
+)
+
+missing_files <- tf_files[!file.exists(tf_files)]
+if (length(missing_files) > 0) {
+  stop("Missing TF ranking files:\n", paste(missing_files, collapse = "\n"))
+}
+
+names(tf_files) <- module_order
+
+```
+
+```{r, ranking function}
+rank_tf_table <- function(df, module_name) {
+  required_cols <- c(
+    "regulatoryGene",
+    "n_targets_subnetwork",
+    "n_targets_top3",
+    "subnetwork_fraction",
+    "enrichment_ratio",
+    "enrichment_p_adj"
+  )
+
+  missing_cols <- setdiff(required_cols, names(df))
+  if (length(missing_cols) > 0) {
+    stop(
+      "Missing required columns in module ", module_name, ": ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+
+  df %>%
+    mutate(
+      n_targets_subnetwork = as.numeric(n_targets_subnetwork),
+      n_targets_top3 = as.numeric(n_targets_top3),
+      subnetwork_fraction = as.numeric(subnetwork_fraction),
+      enrichment_ratio = as.numeric(enrichment_ratio),
+      enrichment_p_adj = as.numeric(enrichment_p_adj),
+      wgcna_module = module_name
+    ) %>%
+    arrange(
+      enrichment_p_adj,
+      desc(enrichment_ratio),
+      desc(n_targets_subnetwork),
+      regulatoryGene
+    ) %>%
+    mutate(rank_within_module = row_number()) %>%
+    dplyr::select(
+      rank_within_module,
+      regulatoryGene,
+      wgcna_module,
+      module_target_counts,
+      n_targets_subnetwork,
+      n_targets_top3,
+      subnetwork_fraction,
+      enrichment_ratio,
+      enrichment_p_adj,
+      median_geo_rank_subnetwork,
+      target_genes_subnetwork,
+      everything()
+    )
+}
+
+ranked_list <- imap(tf_files, function(fp, module_name) {
+  message("Processing module: ", module_name)
+  df <- read_csv(fp, show_col_types = FALSE)
+  rank_tf_table(df, module_name)
+})
+
+combined_tf <- bind_rows(ranked_list)
+```
+
+```{r, ranking function by subnetwork outdegree}
+rank_tf_table_by_subnetwork_outdegree <- function(df, module_name) {
+  required_cols <- c(
+    "regulatoryGene",
+    "n_targets_subnetwork",
+    "n_targets_top3",
+    "subnetwork_fraction",
+    "enrichment_ratio",
+    "enrichment_p_adj"
+  )
+
+  missing_cols <- setdiff(required_cols, names(df))
+  if (length(missing_cols) > 0) {
+    stop(
+      "Missing required columns in module ", module_name, ": ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+
+  df %>%
+    mutate(
+      n_targets_subnetwork = as.numeric(n_targets_subnetwork),
+      n_targets_top3 = as.numeric(n_targets_top3),
+      subnetwork_fraction = as.numeric(subnetwork_fraction),
+      enrichment_ratio = as.numeric(enrichment_ratio),
+      enrichment_p_adj = as.numeric(enrichment_p_adj),
+      wgcna_module = module_name,
+      subnetwork_outdegree_rank = dplyr::min_rank(dplyr::desc(n_targets_subnetwork))
+    ) %>%
+    arrange(
+      subnetwork_outdegree_rank,
+      enrichment_p_adj,
+      desc(enrichment_ratio),
+      median_geo_rank_subnetwork,
+      regulatoryGene
+    ) %>%
+    mutate(rank_within_module = row_number()) %>%
+    dplyr::select(
+      rank_within_module,
+      subnetwork_outdegree_rank,
+      regulatoryGene,
+      wgcna_module,
+      module_target_counts,
+      n_targets_subnetwork,
+      n_targets_top3,
+      subnetwork_fraction,
+      enrichment_ratio,
+      enrichment_p_adj,
+      median_geo_rank_subnetwork,
+      target_genes_subnetwork,
+      everything()
+    )
+}
+
+ranked_list_outdegree <- imap(tf_files, function(fp, module_name) {
+  message("Processing module by subnetwork outdegree: ", module_name)
+  df <- read_csv(fp, show_col_types = FALSE)
+  rank_tf_table_by_subnetwork_outdegree(df, module_name)
+})
+
+combined_tf_outdegree <- bind_rows(ranked_list_outdegree)
+
+ranked_list <- ranked_list_outdegree
+combined_tf <- combined_tf_outdegree
+```
+
+```{r, global summary and top TFs}
+collapse_unique <- function(x) {
+  x <- trimws(as.character(x))
+  x <- x[!is.na(x) & x != "" & x != "NA"]
+
+  if (length(x) == 0) {
+    return(NA_character_)
+  }
+
+  paste(sort(unique(x)), collapse = ";")
+}
+
+first_non_na_chr <- function(x) {
+  x <- trimws(as.character(x))
+  x <- x[!is.na(x) & x != "" & x != "NA"]
+  if (length(x) == 0) {
+    return(NA_character_)
+  }
+  x[[1]]
+}
+
+# gene_names.tsv is a short curated list; summary.tsv has full-genome PRODUCT/GN — merge so TFs not in gene_names still get tf_product
+ann_gene_names <- readr::read_tsv(
+  here::here("MT_genome", "annotation", "MtrunA17r5.0-ANR-EGN-r1.9.gene_names.tsv"),
+  show_col_types = FALSE
+) %>%
+  transmute(
+    regulatoryGene = trimws(locus_tag),
+    acr_names = dplyr::na_if(trimws(acronym), ""),
+    prod_names = dplyr::na_if(trimws(geneProduct), "")
+  ) %>%
+  group_by(regulatoryGene) %>%
+  summarise(
+    acr_names = first_non_na_chr(acr_names),
+    prod_names = first_non_na_chr(prod_names),
+    .groups = "drop"
+  )
+
+ann_summary <- readr::read_tsv(
+  here::here("MT_genome", "annotation", "MtrunA17r5.0-ANR-EGN-r1.9.summary.tsv"),
+  show_col_types = FALSE
+) %>%
+  transmute(
+    regulatoryGene = trimws(LOCUS_TAG),
+    acr_sum = dplyr::na_if(trimws(GN), ""),
+    prod_sum = dplyr::na_if(trimws(PRODUCT), "")
+  ) %>%
+  group_by(regulatoryGene) %>%
+  summarise(
+    acr_sum = first_non_na_chr(acr_sum),
+    prod_sum = first_non_na_chr(prod_sum),
+    .groups = "drop"
+  )
+
+ann_tf_base <- tf_base_map %>%
+  transmute(
+    regulatoryGene = trimws(LOCUS_TAG),
+    prod_base = dplyr::if_else(
+      is.na(PRODUCT) | trimws(as.character(PRODUCT)) %in% c("", "NA"),
+      NA_character_,
+      trimws(as.character(PRODUCT))
+    )
+  ) %>%
+  group_by(regulatoryGene) %>%
+  summarise(prod_base = first_non_na_chr(prod_base), .groups = "drop")
+
+mt_gene_names <- ann_gene_names %>%
+  dplyr::full_join(ann_summary, by = "regulatoryGene") %>%
+  dplyr::left_join(ann_tf_base, by = "regulatoryGene") %>%
+  mutate(
+    tf_acronym = dplyr::coalesce(acr_names, acr_sum),
+    tf_product = dplyr::coalesce(prod_names, prod_sum, prod_base)
+  ) %>%
+  dplyr::select(regulatoryGene, tf_acronym, tf_product)
+
+at_alias_map <- readr::read_csv(
+  here::here("MT_genome", "At_gene_name_to_ID.csv"),
+  show_col_types = FALSE
+) %>%
+  transmute(
+    At_ortholog = toupper(trimws(At_gene_ID)),
+    AT_alias = dplyr::na_if(trimws(gene_symbol), "")
+  ) %>%
+  filter(!is.na(At_ortholog), At_ortholog != "") %>%
+  distinct()
+
+at_annotation <- tf_ortholog_map %>%
+  transmute(
+    regulatoryGene = Mt5.0,
+    At_ortholog = toupper(trimws(At_ortholog))
+  ) %>%
+  filter(
+    !is.na(regulatoryGene), regulatoryGene != "",
+    !is.na(At_ortholog), At_ortholog != ""
+  ) %>%
+  left_join(at_alias_map, by = "At_ortholog") %>%
+  group_by(regulatoryGene) %>%
+  summarise(
+    AT_ID = collapse_unique(At_ortholog),
+    AT_alias = collapse_unique(AT_alias),
+    .groups = "drop"
+  )
+
+tf_annotation <- combined_tf %>%
+  distinct(regulatoryGene) %>%
+  left_join(mt_gene_names, by = "regulatoryGene") %>%
+  left_join(at_annotation, by = "regulatoryGene")
+
+top10_each_module <- combined_tf %>%
+  group_by(wgcna_module) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+# Summary = union of top-10 TFs per module only; one row per TF; stats from top-10 rows only
+tf_summary_across_modules <- top10_each_module %>%
+  group_by(regulatoryGene) %>%
+  summarise(
+    modules_top10 = collapse_unique(wgcna_module),
+    min_enrichment_p_adj = min(enrichment_p_adj, na.rm = TRUE),
+    max_enrichment_ratio = max(enrichment_ratio, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    tf_annotation %>% dplyr::select(regulatoryGene, tf_acronym, tf_product, AT_ID, AT_alias),
+    by = "regulatoryGene"
+  ) %>%
+  arrange(
+    min_enrichment_p_adj,
+    desc(max_enrichment_ratio),
+    regulatoryGene
+  ) %>%
+  mutate(global_rank = row_number()) %>%
+  dplyr::select(
+    global_rank,
+    regulatoryGene,
+    tf_acronym,
+    tf_product,
+    AT_ID,
+    AT_alias,
+    modules_top10,
+    min_enrichment_p_adj,
+    max_enrichment_ratio
+  )
+
+out_dir <- file.path(subnetwork_dir, "combined_tf_ranking_outdegree_first")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+iwalk(ranked_list, function(df, module_name) {
+  write_csv(df, file.path(out_dir, paste0("TF_ranked_", module_name, "_reranked.csv")))
+})
+
+write_csv(combined_tf, file.path(out_dir, "TF_ranked_all_modules_combined.csv"))
+write_csv(tf_summary_across_modules, file.path(out_dir, "TF_summary_across_all_modules.csv"))
+write_csv(top10_each_module, file.path(out_dir, "TF_top10_each_module.csv"))
+
+cat("Saved outputs to:\n", out_dir, "\n")
+```
+
+## Subnetwork size summary
+```{r subnetwork-size-summary}
+subnetwork_size_summary <- purrr::map_dfr(module_order, function(module_name) {
+  edge_file <- file.path(
+    subnetwork_dir,
+    paste0("subnetwork_edges_", module_name, ".csv")
+  )
+
+  if (!file.exists(edge_file)) {
+    stop("Missing subnetwork edge file: ", edge_file, call. = FALSE)
+  }
+
+  edges <- readr::read_csv(edge_file, show_col_types = FALSE)
+  required_columns <- c("regulatoryGene", "targetGene")
+  missing_columns <- setdiff(required_columns, names(edges))
+  if (length(missing_columns) > 0L) {
+    stop(
+      "Missing required column(s) in ", edge_file, ": ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  dplyr::tibble(
+    subnetwork = module_name,
+    TFs = dplyr::n_distinct(edges$regulatoryGene, na.rm = TRUE),
+    genes = dplyr::n_distinct(edges$targetGene, na.rm = TRUE),
+    edges = nrow(edges)
+  )
+})
+
+subnetwork_size_summary <- subnetwork_size_summary %>%
+  dplyr::mutate(subnetwork = factor(subnetwork, levels = module_order)) %>%
+  dplyr::arrange(subnetwork) %>%
+  dplyr::mutate(subnetwork = as.character(subnetwork))
+
+subnetwork_size_csv <- file.path(
+  subnetwork_dir,
+  "subnetwork_TF_gene_edge_counts.csv"
+)
+readr::write_csv(subnetwork_size_summary, subnetwork_size_csv)
+
+knitr::kable(
+  subnetwork_size_summary,
+  align = c("l", "r", "r", "r"),
+  caption = "Numbers of TFs, target genes, and edges in each extracted subnetwork"
+)
+
+cat("Saved subnetwork size summary:", subnetwork_size_csv, "\n")
+```
+
+# Load inputs for top-TF GO enrichment
+
+This chunk reloads the saved top-10 ranking, the TF summary, and the top-3%
+consensus network. Run it, then the GO chunks below, instead of the earlier
+notebook sections.
+
+```{r load-top-tf-go-inputs}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(here)
+  library(topGO)
+  library(GO.db)
+})
+
+subnetwork_dir <- file.path(grn_dir, "subnetwork")
+out_dir <- file.path(subnetwork_dir, "combined_tf_ranking_outdegree_first")
+
+consensus_filtered <- readr::read_csv(
+  file.path(grn_dir, "consensus_network",
+    "consensus_network_deg_tf_top3pct_edges.csv"
+  ),
+  show_col_types = FALSE
+)
+
+top10_each_module <- readr::read_csv(
+  file.path(out_dir, "TF_top10_each_module.csv"),
+  show_col_types = FALSE
+)
+
+tf_summary_across_modules <- readr::read_csv(
+  file.path(out_dir, "TF_summary_across_all_modules.csv"),
+  show_col_types = FALSE
+)
+
+cat(
+  "Loaded top-TF GO inputs:\n",
+  "  Top-10 TF rows: ", nrow(top10_each_module), "\n",
+  "  Unique TFs: ", dplyr::n_distinct(tf_summary_across_modules$regulatoryGene), "\n",
+  "  Consensus edges: ", nrow(consensus_filtered), "\n",
+  sep = ""
+)
+```
+
+# Generalized GO enrichment for top TFs
+
+For every unique TF in the top-10-per-module union, Biological Process
+enrichment is run separately for each module in which the TF ranks in the top
+10 and once for all of the TF's targets in the consensus top-3% GRN. Module
+targets are never pooled. All tests use the unique target genes in the
+consensus top-3% GRN as the universe and topGO's `weight01` Fisher test.
+Terms with Fisher p < 0.05 are retained. `weight01` already accounts for
+the GO hierarchy, so no further p-value correction is applied.
+
+```{r generalized-tf-target-go-enrichment}
+suppressPackageStartupMessages({
+  library(topGO)
+  library(GO.db)
+  library(purrr)
+})
+
+go_root_ids <- c("GO:0008150", "GO:0003674", "GO:0005575")
+max_annotated <- 300L
+min_query_genes <- 5L
+top_terms_per_analysis <- 10L
+
+all_genes <- consensus_filtered %>%
+  dplyr::filter(!is.na(targetGene), trimws(as.character(targetGene)) != "") %>%
+  dplyr::pull(targetGene) %>%
+  unique() %>%
+  sort()
+
+if (length(all_genes) == 0L) {
+  stop("No target genes found in the top-3% consensus GRN.")
+}
+
+go_file <- here::here("MT_genome", "annotation", "GO_gene_pairs_MtrunA17r5.tsv")
+if (!file.exists(go_file)) {
+  stop("GO annotation file not found: ", go_file)
+}
+
+go_pairs <- readr::read_tsv(
+  go_file,
+  col_types = readr::cols(.default = readr::col_character()),
+  show_col_types = FALSE
+) %>%
+  dplyr::transmute(
+    gene = trimws(LOCUS_TAG),
+    go = trimws(GO)
+  ) %>%
+  dplyr::filter(!is.na(gene), gene != "", !is.na(go), go != "") %>%
+  dplyr::distinct(gene, go)
+
+GO2genes <- split(go_pairs$gene, go_pairs$go)
+annotated_background_genes <- intersect(all_genes, unique(go_pairs$gene))
+
+parse_target_genes <- function(x) {
+  x <- trimws(unlist(strsplit(as.character(x), ";\\s*", perl = TRUE), use.names = FALSE))
+  unique(x[!is.na(x) & x != "" & x != "NA"])
+}
+
+parse_topgo_p <- function(x) {
+  x <- trimws(as.character(x))
+  suppressWarnings(as.numeric(sub("^<\\s*", "", x)))
+}
+
+empty_go_terms <- function() {
+  tibble::tibble(
+    analysis_id = character(),
+    regulatoryGene = character(),
+    tf_acronym = character(),
+    tf_product = character(),
+    AT_ID = character(),
+    AT_alias = character(),
+    analysis_scope = character(),
+    wgcna_module = character(),
+    rank_within_module = integer(),
+    query_gene_n = integer(),
+    query_annotated_gene_n = integer(),
+    background_gene_n = integer(),
+    background_annotated_gene_n = integer(),
+    GO.ID = character(),
+    GO_term = character(),
+    Annotated = integer(),
+    Significant = integer(),
+    Expected = double(),
+    fold_enrichment = double(),
+    Fisher_p_value = double()
+  )
+}
+
+make_analysis_row <- function(
+  regulatory_gene,
+  tf_acronym,
+  tf_product,
+  at_id,
+  at_alias,
+  analysis_scope,
+  wgcna_module,
+  rank_within_module,
+  query_genes
+) {
+  module_key <- if (is.na(wgcna_module)) "all_GRN_targets" else wgcna_module
+  tibble::tibble(
+    analysis_id = paste(regulatory_gene, analysis_scope, module_key, sep = "__"),
+    regulatoryGene = regulatory_gene,
+    tf_acronym = tf_acronym,
+    tf_product = tf_product,
+    AT_ID = at_id,
+    AT_alias = at_alias,
+    analysis_scope = analysis_scope,
+    wgcna_module = wgcna_module,
+    rank_within_module = as.integer(rank_within_module),
+    query_genes = list(sort(unique(query_genes)))
+  )
+}
+
+module_analyses <- purrr::map_dfr(
+  seq_len(nrow(top10_each_module)),
+  function(i) {
+    row <- top10_each_module[i, , drop = FALSE]
+    annotation <- tf_summary_across_modules %>%
+      dplyr::filter(regulatoryGene == row$regulatoryGene[[1]]) %>%
+      dplyr::slice_head(n = 1)
+
+    make_analysis_row(
+      regulatory_gene = row$regulatoryGene[[1]],
+      tf_acronym = row$tf_acronym[[1]],
+      tf_product = row$tf_product[[1]],
+      at_id = annotation$AT_ID[[1]],
+      at_alias = annotation$AT_alias[[1]],
+      analysis_scope = "module",
+      wgcna_module = as.character(row$wgcna_module[[1]]),
+      rank_within_module = row$rank_within_module[[1]],
+      query_genes = parse_target_genes(row$target_genes_subnetwork[[1]])
+    )
+  }
+)
+
+selected_tf_annotation <- tf_summary_across_modules %>%
+  dplyr::select(
+    regulatoryGene, tf_acronym, tf_product, AT_ID, AT_alias
+  ) %>%
+  dplyr::distinct(regulatoryGene, .keep_all = TRUE)
+
+global_analyses <- purrr::map_dfr(
+  seq_len(nrow(selected_tf_annotation)),
+  function(i) {
+    row <- selected_tf_annotation[i, , drop = FALSE]
+    tf_targets <- consensus_filtered %>%
+      dplyr::filter(
+        regulatoryGene == row$regulatoryGene[[1]],
+        !is.na(targetGene),
+        trimws(as.character(targetGene)) != ""
+      ) %>%
+      dplyr::pull(targetGene)
+
+    make_analysis_row(
+      regulatory_gene = row$regulatoryGene[[1]],
+      tf_acronym = row$tf_acronym[[1]],
+      tf_product = row$tf_product[[1]],
+      at_id = row$AT_ID[[1]],
+      at_alias = row$AT_alias[[1]],
+      analysis_scope = "all_GRN_targets",
+      wgcna_module = NA_character_,
+      rank_within_module = NA_integer_,
+      query_genes = tf_targets
+    )
+  }
+)
+
+go_analyses <- dplyr::bind_rows(module_analyses, global_analyses) %>%
+  dplyr::mutate(
+    query_genes = purrr::map(query_genes, ~ intersect(unique(.x), all_genes))
+  )
+
+if (anyDuplicated(go_analyses$analysis_id)) {
+  stop("GO analysis IDs are not unique.")
+}
+
+run_go_analysis <- function(analysis_row) {
+  query_genes <- analysis_row$query_genes[[1]]
+  query_annotated_genes <- intersect(query_genes, annotated_background_genes)
+  query_gene_n <- length(query_genes)
+  query_annotated_gene_n <- length(query_annotated_genes)
+
+  summary_base <- analysis_row %>%
+    dplyr::select(-query_genes) %>%
+    dplyr::mutate(
+      query_gene_n = query_gene_n,
+      query_annotated_gene_n = query_annotated_gene_n,
+      background_gene_n = length(all_genes),
+      background_annotated_gene_n = length(annotated_background_genes)
+    )
+
+  if (query_gene_n < min_query_genes) {
+    return(list(
+      terms = empty_go_terms(),
+      summary = summary_base %>%
+        dplyr::mutate(
+          status = "skipped",
+          status_reason = paste0("fewer than ", min_query_genes, " query genes"),
+          tested_term_n = 0L
+        )
+    ))
+  }
+
+  if (query_annotated_gene_n < min_query_genes) {
+    return(list(
+      terms = empty_go_terms(),
+      summary = summary_base %>%
+        dplyr::mutate(
+          status = "skipped",
+          status_reason = paste0("fewer than ", min_query_genes, " GO-annotated query genes"),
+          tested_term_n = 0L
+        )
+    ))
+  }
+
+  gene_list <- stats::setNames(as.integer(all_genes %in% query_genes), all_genes)
+  GOdata <- methods::new(
+    "topGOdata",
+    ontology = "BP",
+    allGenes = gene_list,
+    geneSel = function(x) x == 1,
+    annot = annFUN.GO2genes,
+    GO2genes = GO2genes,
+    nodeSize = 5
+  )
+  fisher_result <- runTest(GOdata, algorithm = "weight01", statistic = "fisher")
+  tested_term_n <- length(score(fisher_result))
+
+  if (tested_term_n == 0L) {
+    return(list(
+      terms = empty_go_terms(),
+      summary = summary_base %>%
+        dplyr::mutate(
+          status = "completed_no_terms",
+          status_reason = "topGO returned no tested BP terms",
+          tested_term_n = 0L
+        )
+    ))
+  }
+
+  topgo_table <- GenTable(
+    GOdata,
+    Fisher = fisher_result,
+    orderBy = "Fisher",
+    ranksOf = "Fisher",
+    topNodes = tested_term_n,
+    numChar = 1000
+  )
+
+  go_info <- AnnotationDbi::select(
+    GO.db,
+    keys = unique(topgo_table$GO.ID),
+    keytype = "GOID",
+    columns = c("TERM", "ONTOLOGY")
+  ) %>%
+    dplyr::filter(ONTOLOGY == "BP") %>%
+    dplyr::distinct(GOID, .keep_all = TRUE)
+
+  terms <- topgo_table %>%
+    dplyr::left_join(
+      go_info %>% dplyr::rename(GO.ID = GOID),
+      by = "GO.ID"
+    ) %>%
+    dplyr::mutate(
+      GO_term = dplyr::coalesce(TERM, Term),
+      Annotated = suppressWarnings(as.integer(as.character(Annotated))),
+      Significant = suppressWarnings(as.integer(as.character(Significant))),
+      Expected = suppressWarnings(as.numeric(as.character(Expected))),
+      Fisher_p_value = parse_topgo_p(Fisher),
+      fold_enrichment = dplyr::if_else(
+        !is.na(Expected) & Expected > 0 & !is.na(Significant),
+        Significant / Expected,
+        NA_real_
+      )
+    ) %>%
+    dplyr::transmute(
+      analysis_id = analysis_row$analysis_id[[1]],
+      regulatoryGene = analysis_row$regulatoryGene[[1]],
+      tf_acronym = analysis_row$tf_acronym[[1]],
+      tf_product = analysis_row$tf_product[[1]],
+      AT_ID = analysis_row$AT_ID[[1]],
+      AT_alias = analysis_row$AT_alias[[1]],
+      analysis_scope = analysis_row$analysis_scope[[1]],
+      wgcna_module = analysis_row$wgcna_module[[1]],
+      rank_within_module = analysis_row$rank_within_module[[1]],
+      query_gene_n,
+      query_annotated_gene_n,
+      background_gene_n = length(all_genes),
+      background_annotated_gene_n = length(annotated_background_genes),
+      GO.ID,
+      GO_term,
+      Annotated,
+      Significant,
+      Expected,
+      fold_enrichment,
+      Fisher_p_value
+    )
+
+  list(
+    terms = terms,
+    summary = summary_base %>%
+      dplyr::mutate(
+        status = "completed",
+        status_reason = NA_character_,
+        tested_term_n = nrow(terms)
+      )
+  )
+}
+
+go_results <- purrr::map(
+  split(go_analyses, seq_len(nrow(go_analyses))),
+  run_go_analysis
+)
+
+tf_go_all_terms <- purrr::map_dfr(go_results, "terms") %>%
+  dplyr::mutate(
+    passes_display_filter = (
+      !GO.ID %in% go_root_ids &
+        !is.na(Annotated) &
+        Annotated <= max_annotated
+    ),
+    significant_within_analysis = (
+      passes_display_filter &
+        !is.na(Fisher_p_value) &
+        Fisher_p_value < 0.05
+    )
+  )
+
+tf_go_significant <- tf_go_all_terms %>%
+  dplyr::filter(significant_within_analysis) %>%
+  dplyr::arrange(
+    regulatoryGene, analysis_scope, wgcna_module,
+    Fisher_p_value, GO.ID
+  )
+
+tf_go_top_terms <- tf_go_significant %>%
+  dplyr::group_by(analysis_id) %>%
+  dplyr::arrange(
+    Fisher_p_value,
+    dplyr::desc(fold_enrichment),
+    .by_group = TRUE
+  ) %>%
+  dplyr::slice_head(n = top_terms_per_analysis) %>%
+  dplyr::mutate(term_rank = dplyr::row_number()) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(term_rank, dplyr::everything())
+
+significance_counts <- tf_go_all_terms %>%
+  dplyr::group_by(analysis_id) %>%
+  dplyr::summarise(
+    significant_term_n = sum(significant_within_analysis, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+tf_go_query_summary <- purrr::map_dfr(go_results, "summary") %>%
+  dplyr::left_join(significance_counts, by = "analysis_id") %>%
+  dplyr::mutate(
+    significant_term_n = dplyr::coalesce(significant_term_n, 0L),
+    status = dplyr::if_else(
+      status == "completed" & significant_term_n == 0L,
+      "completed_no_significant_terms",
+      status
+    ),
+    status_reason = dplyr::if_else(
+      status == "completed_no_significant_terms" & is.na(status_reason),
+      "no BP terms passed weight01 Fisher p < 0.05 and display filters",
+      status_reason
+    )
+  ) %>%
+  dplyr::arrange(regulatoryGene, analysis_scope, wgcna_module)
+
+output_files <- c(
+  query_summary = file.path(out_dir, "TF_GO_BP_query_summary.csv"),
+  all_terms = file.path(out_dir, "TF_GO_BP_all_terms.csv"),
+  significant = file.path(out_dir, "TF_GO_BP_significant.csv"),
+  top_terms = file.path(out_dir, "TF_GO_BP_top_terms.csv")
+)
+
+readr::write_csv(tf_go_query_summary, output_files[["query_summary"]], na = "NA")
+readr::write_csv(tf_go_all_terms, output_files[["all_terms"]], na = "NA")
+readr::write_csv(tf_go_significant, output_files[["significant"]], na = "NA")
+readr::write_csv(tf_go_top_terms, output_files[["top_terms"]], na = "NA")
+
+cat(
+  "Generalized TF target GO (BP):\n",
+  "  Selected TFs: ", dplyr::n_distinct(go_analyses$regulatoryGene), "\n",
+  "  Module analyses: ", sum(go_analyses$analysis_scope == "module"), "\n",
+  "  All-GRN-target analyses: ",
+  sum(go_analyses$analysis_scope == "all_GRN_targets"), "\n",
+  "  Tested term rows: ", nrow(tf_go_all_terms), "\n",
+  "  Significant term rows: ", nrow(tf_go_significant), "\n",
+  "  Outputs: ", paste(output_files, collapse = "\n           "), "\n",
+  sep = ""
+)
+```
+
+# Gene-level long table for significant TF GO terms
+
+This chunk does not rerun enrichment. It reads `TF_GO_BP_significant.csv` and
+expands each saved term to the query genes annotated to that term or to one
+of its Biological Process descendants.
+
+```{r significant-tf-go-gene-long}
+significant_go_csv <- file.path(out_dir, "TF_GO_BP_significant.csv")
+if (!file.exists(significant_go_csv)) {
+  stop("Significant GO output not found: ", significant_go_csv)
+}
+
+tf_go_significant_saved <- readr::read_csv(
+  significant_go_csv,
+  show_col_types = FALSE
+)
+
+parse_target_genes <- function(x) {
+  x <- trimws(unlist(strsplit(as.character(x), ";\\s*", perl = TRUE), use.names = FALSE))
+  unique(x[!is.na(x) & x != "" & x != "NA"])
+}
+
+background_genes <- consensus_filtered %>%
+  dplyr::filter(!is.na(targetGene), trimws(as.character(targetGene)) != "") %>%
+  dplyr::pull(targetGene) %>%
+  unique()
+
+module_query_genes <- top10_each_module %>%
+  dplyr::transmute(
+    analysis_id = paste(regulatoryGene, "module", wgcna_module, sep = "__"),
+    targetGene = purrr::map(
+      target_genes_subnetwork,
+      ~ intersect(parse_target_genes(.x), background_genes)
+    )
+  ) %>%
+  tidyr::unnest(targetGene)
+
+global_query_genes <- consensus_filtered %>%
+  dplyr::filter(!is.na(targetGene), trimws(as.character(targetGene)) != "") %>%
+  dplyr::transmute(
+    analysis_id = paste(regulatoryGene, "all_GRN_targets", "all_GRN_targets", sep = "__"),
+    targetGene = trimws(as.character(targetGene))
+  ) %>%
+  dplyr::filter(targetGene != "", targetGene %in% background_genes) %>%
+  dplyr::distinct()
+
+query_genes_long <- dplyr::bind_rows(module_query_genes, global_query_genes) %>%
+  dplyr::distinct()
+
+go_pairs <- readr::read_tsv(
+  here::here("MT_genome", "annotation", "GO_gene_pairs_MtrunA17r5.tsv"),
+  col_types = readr::cols(.default = readr::col_character()),
+  show_col_types = FALSE
+) %>%
+  dplyr::transmute(gene = trimws(LOCUS_TAG), go = trimws(GO)) %>%
+  dplyr::filter(!is.na(gene), gene != "", !is.na(go), go != "") %>%
+  dplyr::distinct()
+
+significant_go_ids <- unique(tf_go_significant_saved$GO.ID)
+offspring <- AnnotationDbi::as.list(GO.db::GOBPOFFSPRING[significant_go_ids])
+term_members <- purrr::imap_dfr(offspring, function(children, term_id) {
+  children <- children[!is.na(children)]
+  tibble::tibble(
+    GO.ID = term_id,
+    go = unique(c(term_id, children))
+  )
+})
+
+genes_in_significant_terms <- term_members %>%
+  dplyr::inner_join(go_pairs, by = "go") %>%
+  dplyr::distinct(GO.ID, targetGene = gene)
+
+tf_go_significant_gene_long <- tf_go_significant_saved %>%
+  dplyr::inner_join(query_genes_long, by = "analysis_id", relationship = "many-to-many") %>%
+  dplyr::inner_join(genes_in_significant_terms, by = c("GO.ID", "targetGene")) %>%
+  dplyr::arrange(
+    regulatoryGene,
+    analysis_scope,
+    wgcna_module,
+    Fisher_p_value,
+    GO.ID,
+    targetGene
+  )
+
+go_gene_long_csv <- file.path(
+  out_dir,
+  "TF_GO_BP_significant_gene_long.csv"
+)
+readr::write_csv(
+  tf_go_significant_gene_long,
+  go_gene_long_csv,
+  na = "NA"
+)
+
+cat(
+  "Gene-level significant TF GO table: ",
+  nrow(tf_go_significant_gene_long),
+  " rows -> ",
+  go_gene_long_csv,
+  "\n",
+  sep = ""
+)
+```
+
+# Pooled top-module and all-GRN target GO
+
+For each TF in the top-10-per-module union, Biological Process enrichment is
+run twice with topGO's `weight01` Fisher test. One query pools that TF's
+targets across every module where it ranks in the top 10. The other query is
+every target of that TF in the consensus top-3% network. The background is
+every unique target gene in that network. Terms with Fisher p < 0.05 are
+retained. No further p-value correction is applied.
+
+```{r pooled-and-all-grn-tf-go}
+go_root_ids <- c("GO:0008150", "GO:0003674", "GO:0005575")
+max_annotated <- 300L
+pooled_p_cutoff <- 0.05
+
+all_genes <- consensus_filtered %>%
+  dplyr::filter(!is.na(targetGene), trimws(as.character(targetGene)) != "") %>%
+  dplyr::pull(targetGene) %>%
+  unique()
+
+go_pairs <- readr::read_tsv(
+  here::here("MT_genome", "annotation", "GO_gene_pairs_MtrunA17r5.tsv"),
+  col_types = readr::cols(.default = readr::col_character()),
+  show_col_types = FALSE
+) %>%
+  dplyr::transmute(gene = trimws(LOCUS_TAG), go = trimws(GO)) %>%
+  dplyr::filter(!is.na(gene), gene != "", !is.na(go), go != "") %>%
+  dplyr::distinct()
+GO2genes <- split(go_pairs$gene, go_pairs$go)
+
+parse_target_genes <- function(x) {
+  x <- trimws(unlist(strsplit(as.character(x), ";\\s*", perl = TRUE), use.names = FALSE))
+  unique(x[!is.na(x) & x != "" & x != "NA"])
+}
+
+acronym_product_col <- function(acr, prod) {
+  a <- trimws(as.character(acr))
+  p <- trimws(as.character(prod))
+  a <- if (length(a) == 0L || is.na(a) || a == "") NA_character_ else a
+  p <- if (length(p) == 0L || is.na(p) || p == "") NA_character_ else p
+  if (is.na(a) && is.na(p)) {
+    return(NA_character_)
+  }
+  if (is.na(a)) {
+    return(p)
+  }
+  if (is.na(p)) {
+    return(a)
+  }
+  paste(a, p, sep = "; ")
+}
+
+empty_long <- function() {
+  tibble::tibble(
+    regulatoryGene = character(0),
+    tf_acronym = character(0),
+    tf_product = character(0),
+    query_set = character(0),
+    query_gene_n = integer(0),
+    GO.ID = character(0),
+    GO_term_enriched = character(0),
+    Annotated = integer(0),
+    Significant = integer(0),
+    Expected = double(0),
+    significant = logical(0),
+    fold_enriched = double(0),
+    Fisher.pval = double(0)
+  )
+}
+
+run_pooled_go <- function(query_genes) {
+  query_genes <- intersect(unique(query_genes), all_genes)
+  n_query <- length(query_genes)
+  if (n_query < 5L) {
+    return(list(n_query = n_query, terms = empty_long()))
+  }
+
+  gene_list <- stats::setNames(as.integer(all_genes %in% query_genes), all_genes)
+  GOdata <- methods::new(
+    "topGOdata",
+    ontology = "BP",
+    allGenes = gene_list,
+    geneSel = function(x) x == 1,
+    annot = annFUN.GO2genes,
+    GO2genes = GO2genes,
+    nodeSize = 5
+  )
+  res_fisher <- runTest(GOdata, algorithm = "weight01", statistic = "fisher")
+  tested_term_n <- length(score(res_fisher))
+  if (tested_term_n == 0L) {
+    return(list(n_query = n_query, terms = empty_long()))
+  }
+
+  topgo_bp <- GenTable(
+    GOdata,
+    Fisher = res_fisher,
+    orderBy = "Fisher",
+    ranksOf = "Fisher",
+    topNodes = tested_term_n,
+    numChar = 1000
+  )
+  if (nrow(topgo_bp) == 0L) {
+    return(list(n_query = n_query, terms = empty_long()))
+  }
+
+  go_info <- AnnotationDbi::select(
+    GO.db,
+    keys = unique(topgo_bp$GO.ID),
+    keytype = "GOID",
+    columns = c("TERM", "ONTOLOGY")
+  ) %>%
+    dplyr::distinct(GOID, .keep_all = TRUE)
+
+  terms <- topgo_bp %>%
+    dplyr::left_join(go_info %>% dplyr::rename(GO.ID = GOID), by = "GO.ID") %>%
+    dplyr::mutate(
+      term_label = dplyr::coalesce(TERM, Term),
+      Fisher.pval = dplyr::if_else(grepl("^<", Fisher), 1e-30, as.numeric(Fisher)),
+      Expected_num = suppressWarnings(as.numeric(as.character(Expected))),
+      Significant_num = suppressWarnings(as.integer(as.character(Significant)))
+    ) %>%
+    dplyr::filter(
+      !GO.ID %in% go_root_ids,
+      Annotated <= max_annotated,
+      !is.na(Fisher.pval),
+      Fisher.pval < pooled_p_cutoff
+    ) %>%
+    dplyr::arrange(Fisher.pval) %>%
+    dplyr::transmute(
+      GO.ID,
+      GO_term_enriched = term_label,
+      Annotated,
+      Significant = Significant_num,
+      Expected = Expected_num,
+      significant = TRUE,
+      fold_enriched = dplyr::if_else(
+        !is.na(Expected) & Expected > 0 & !is.na(Significant),
+        Significant / Expected,
+        NA_real_
+      ),
+      Fisher.pval
+    )
+
+  list(n_query = n_query, terms = terms)
+}
+
+summarise_terms <- function(terms) {
+  if (nrow(terms) == 0L) {
+    return(list(
+      significant = FALSE,
+      fold_enrichment = NA_character_,
+      Target_Gene_GoTerm_enriched = NA_character_
+    ))
+  }
+  list(
+    significant = TRUE,
+    fold_enrichment = paste(
+      ifelse(
+        is.finite(terms$fold_enriched),
+        format(round(as.numeric(terms$fold_enriched), 3), trim = TRUE, nsmall = 0),
+        ""
+      ),
+      collapse = "; "
+    ),
+    Target_Gene_GoTerm_enriched = paste(
+      paste0(terms$GO_term_enriched, "; ", terms$GO.ID),
+      collapse = "; "
+    )
+  )
+}
+
+pooled_go_results <- purrr::map(seq_len(nrow(tf_summary_across_modules)), function(i) {
+  tf_row <- tf_summary_across_modules[i, , drop = FALSE]
+  rg <- tf_row$regulatoryGene[[1]]
+  sub <- dplyr::filter(top10_each_module, regulatoryGene == rg)
+  pooled_targets <- unique(unlist(
+    lapply(sub$target_genes_subnetwork, parse_target_genes),
+    use.names = FALSE
+  ))
+  all_targets <- consensus_filtered %>%
+    dplyr::filter(
+      regulatoryGene == rg,
+      !is.na(targetGene),
+      trimws(as.character(targetGene)) != ""
+    ) %>%
+    dplyr::pull(targetGene) %>%
+    unique()
+
+  list(
+    tf_row = tf_row,
+    all_grn = run_pooled_go(all_targets),
+    subnetwork = run_pooled_go(pooled_targets)
+  )
+})
+
+bind_scope_terms <- function(result, scope) {
+  scope_key <- c(
+    all_GRN_targets = "all_grn",
+    subnetwork_targets_combined = "subnetwork"
+  )[[scope]]
+  tested <- result[[scope_key]]
+  tested$terms %>%
+    dplyr::mutate(
+      regulatoryGene = result$tf_row$regulatoryGene[[1]],
+      tf_acronym = result$tf_row$tf_acronym[[1]],
+      tf_product = result$tf_row$tf_product[[1]],
+      query_set = scope,
+      query_gene_n = tested$n_query,
+      .before = 1
+    )
+}
+
+pooled_go_long <- purrr::map_dfr(pooled_go_results, function(result) {
+  dplyr::bind_rows(
+    bind_scope_terms(result, "all_GRN_targets"),
+    bind_scope_terms(result, "subnetwork_targets_combined")
+  )
+})
+if (nrow(pooled_go_long) == 0L) {
+  pooled_go_long <- empty_long()
+}
+
+pooled_go_summary <- purrr::map_dfr(pooled_go_results, function(result) {
+  tf_row <- result$tf_row
+  modules_label <- gsub("; ", " ", as.character(tf_row$modules_top10[[1]]), fixed = TRUE)
+  purrr::map_dfr(
+    c("all_GRN_targets", "subnetwork_targets_combined"),
+    function(scope) {
+      tested <- result[[c(
+        all_GRN_targets = "all_grn",
+        subnetwork_targets_combined = "subnetwork"
+      )[[scope]]]]
+      term_summary <- summarise_terms(tested$terms)
+      tibble::tibble(
+        TF_ID = tf_row$regulatoryGene[[1]],
+        acronym_TF_product = acronym_product_col(
+          tf_row$tf_acronym[[1]],
+          tf_row$tf_product[[1]]
+        ),
+        query_set = scope,
+        target_gene_in_modules = modules_label,
+        CombinedQueryGene = tested$n_query,
+        significant = term_summary$significant,
+        fold_enrichment = term_summary$fold_enrichment,
+        Target_Gene_GoTerm_enriched = term_summary$Target_Gene_GoTerm_enriched
+      )
+    }
+  )
+})
+
+subnetwork_long <- pooled_go_long %>%
+  dplyr::filter(query_set == "subnetwork_targets_combined")
+all_grn_long <- pooled_go_long %>%
+  dplyr::filter(query_set == "all_GRN_targets")
+
+go_csv_long <- file.path(out_dir, "TF_top10_targets_GO_BP_significant_top3GRN_background.csv")
+go_csv_all_long <- file.path(out_dir, "TF_all_GRN_targets_GO_BP_significant_top3GRN_background.csv")
+go_csv_wide <- file.path(out_dir, "TF_top10_targets_GO_BP_TF_summary_top3GRN_background.csv")
+readr::write_csv(subnetwork_long, go_csv_long)
+readr::write_csv(all_grn_long, go_csv_all_long)
+readr::write_csv(pooled_go_summary, go_csv_wide)
+
+cat(
+  "Pooled TF target GO (BP, weight01, p < 0.05):\n",
+  "  Subnetwork-combined terms: ", nrow(subnetwork_long), " -> ", go_csv_long, "\n",
+  "  All-GRN-target terms: ", nrow(all_grn_long), " -> ", go_csv_all_long, "\n",
+  "  Summary rows: ", nrow(pooled_go_summary), " -> ", go_csv_wide, "\n",
+  sep = ""
+)
+```
+
+
