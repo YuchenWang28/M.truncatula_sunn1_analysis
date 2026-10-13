@@ -1,0 +1,1621 @@
+---
+title: "Section06_PlotGeneExpression"
+author: "Yuchen Wang"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+# Individual gene expression
+
+### Setup
+
+This script estimates DESeq2 median-ratio size factors directly from the count
+matrix and plots normalized counts in the same style as the module eigengene
+plot in `ShootWGCNA_test.Rmd`.
+
+```{r expression-setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(here)
+project_library <- here(".r-library", paste(R.version$major,
+                                           strsplit(R.version$minor, "\\.")[[1]][1],
+                                           sep = "."))
+if (dir.exists(project_library)) .libPaths(c(project_library, .libPaths()))
+in_dir <- here("Data", "data_for_publication")
+expression_out_dir <- file.path(in_dir, "Gene_expression")
+library(DESeq2)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(ggplot2)
+```
+
+### User inputs
+
+```{r expression-user-inputs}
+## Add one or more Medicago gene IDs.
+genes_of_interest <- c("MtrunA17_Chr1g0156231",
+"MtrunA17_Chr7g0219081",
+"MtrunA17_Chr3g0103441",
+"MtrunA17_Chr4g0051121",
+"MtrunA17_Chr3g0105411"
+)
+
+design_file <- file.path(in_dir, "Trait_A17_sunn.csv")
+count_file <- file.path(in_dir, "ShootCounts_A17_sunn.csv")
+
+## These samples were excluded from the shoot DESeq/WGCNA analyses.
+excluded_sample_ids <- c("MTNC159", "MTNC184")
+
+minimum_total_count <- 10
+output_dir <- file.path(expression_out_dir, "gene_expression_plots", "shoot")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+### Create the DESeq2 object and normalized-count matrix
+
+```{r expression-normalize-counts}
+if (!file.exists(design_file)) {
+  stop("Design file not found: ", design_file)
+}
+if (!file.exists(count_file)) {
+  stop("Count file not found: ", count_file)
+}
+
+sample_data <- readr::read_csv(design_file, show_col_types = FALSE)
+count_data <- readr::read_csv(count_file, show_col_types = FALSE)
+
+required_traits <- c("RNA.seq.id", "Line", "CO2", "Nitrogen")
+missing_traits <- setdiff(required_traits, names(sample_data))
+if (length(missing_traits) > 0) {
+  stop("Missing required trait column(s): ", paste(missing_traits, collapse = ", "))
+}
+if (!"GeneID" %in% names(count_data)) {
+  stop("The count file must contain a GeneID column.")
+}
+if (anyDuplicated(count_data$GeneID)) {
+  stop("The count file contains duplicated GeneID values.")
+}
+
+count_matrix <- as.matrix(count_data[, setdiff(names(count_data), "GeneID")])
+storage.mode(count_matrix) <- "numeric"
+rownames(count_matrix) <- count_data$GeneID
+
+shared_samples <- intersect(colnames(count_matrix), sample_data$RNA.seq.id)
+shared_samples <- setdiff(shared_samples, excluded_sample_ids)
+if (length(shared_samples) == 0) {
+  stop("No shared samples remain after matching the input files and exclusions.")
+}
+
+sample_data <- sample_data %>%
+  dplyr::filter(RNA.seq.id %in% shared_samples) %>%
+  dplyr::distinct(RNA.seq.id, .keep_all = TRUE) %>%
+  as.data.frame()
+rownames(sample_data) <- sample_data$RNA.seq.id
+sample_data <- sample_data[shared_samples, , drop = FALSE]
+
+count_matrix <- round(count_matrix[, shared_samples, drop = FALSE])
+keep_genes <- rowSums(count_matrix) >= minimum_total_count
+count_matrix <- count_matrix[keep_genes, , drop = FALSE]
+
+sample_data$Line <- factor(sample_data$Line, levels = c("A17", "sunn"))
+sample_data$CO2 <- factor(sample_data$CO2, levels = c("AC", "EC"))
+sample_data$Nitrogen <- as.numeric(as.character(sample_data$Nitrogen))
+
+if (anyNA(sample_data$Line) || anyNA(sample_data$CO2) ||
+    anyNA(sample_data$Nitrogen)) {
+  stop("Line, CO2, or Nitrogen contains missing or unrecognized values.")
+}
+
+## Estimate the same default median-ratio size factors used by
+## estimateSizeFactors(), directly from the count matrix. This notebook does not
+## need a DESeqDataSet, and avoiding one also bypasses the ExpData S4 class-cache
+## bug in affected Bioconductor 3.21 installations.
+size_factors <- DESeq2::estimateSizeFactorsForMatrix(count_matrix)
+normalized_counts <- sweep(count_matrix, 2, size_factors, FUN = "/")
+
+missing_genes <- setdiff(genes_of_interest, rownames(normalized_counts))
+if (length(missing_genes) > 0) {
+  warning(
+    "Gene(s) absent or removed by the minimum-count filter: ",
+    paste(missing_genes, collapse = ", ")
+  )
+}
+
+cat("Samples normalized: ", ncol(normalized_counts), "\n", sep = "")
+cat("Genes retained: ", nrow(normalized_counts), "\n", sep = "")
+```
+
+### Plot normalized counts
+
+Each panel shows individual samples, treatment mean +/- 1 SD, and a
+LOESS-smoothed nitrogen response for each CO2 treatment.
+
+```{r expression-gene-expression-plot-function}
+plot_normalized_gene <- function(
+    gene_id,
+    norm_counts = normalized_counts,
+    metadata = sample_data,
+    co2_levels = c("AC", "EC"),
+    nitrogen_levels = NULL,
+    line_width = 1.2,
+    smooth_span = 0.75,
+    sample_point_size = 1.8,
+    sample_point_alpha = 0.7,
+    detect_outliers = TRUE,
+    outlier_coefficient = 1.5,
+    print_anova = TRUE,
+    save_plot = TRUE,
+    plot_output_dir = output_dir) {
+
+  if (!gene_id %in% rownames(norm_counts)) {
+    warning("Gene not available in the normalized-count matrix: ", gene_id)
+    return(NULL)
+  }
+
+  sample_ids <- intersect(colnames(norm_counts), rownames(metadata))
+  plot_df <- metadata[sample_ids, , drop = FALSE] %>%
+    dplyr::mutate(
+      Sample = sample_ids,
+      NormalizedCount = as.numeric(norm_counts[gene_id, sample_ids]),
+      Line = factor(Line),
+      CO2 = factor(CO2, levels = co2_levels),
+      Nitrogen_mM = as.numeric(as.character(Nitrogen))
+    ) %>%
+    dplyr::filter(
+      is.finite(NormalizedCount),
+      !is.na(Line),
+      !is.na(CO2),
+      is.finite(Nitrogen_mM)
+    )
+
+  if (!is.null(nitrogen_levels)) {
+    selected_nitrogen_levels <- suppressWarnings(
+      as.numeric(as.character(nitrogen_levels))
+    )
+    if (
+      length(selected_nitrogen_levels) == 0L ||
+      anyNA(selected_nitrogen_levels) ||
+      any(!is.finite(selected_nitrogen_levels))
+    ) {
+      stop("nitrogen_levels must contain one or more finite numeric values.")
+    }
+    selected_nitrogen_levels <- unique(selected_nitrogen_levels)
+
+    unavailable_nitrogen_levels <- setdiff(
+      selected_nitrogen_levels,
+      sort(unique(plot_df$Nitrogen_mM))
+    )
+    if (length(unavailable_nitrogen_levels) > 0L) {
+      warning(
+        "Requested nitrogen level(s) not found for ", gene_id, ": ",
+        paste(unavailable_nitrogen_levels, collapse = ", ")
+      )
+    }
+
+    plot_df <- plot_df %>%
+      dplyr::filter(Nitrogen_mM %in% selected_nitrogen_levels)
+  }
+
+  removed_outliers <- plot_df[0, , drop = FALSE]
+  if (detect_outliers) {
+    plot_df <- plot_df %>%
+      dplyr::group_by(Line, CO2, Nitrogen_mM) %>%
+      dplyr::mutate(
+        .Q1 = stats::quantile(NormalizedCount, 0.25, na.rm = TRUE),
+        .Q3 = stats::quantile(NormalizedCount, 0.75, na.rm = TRUE),
+        .IQR = stats::IQR(NormalizedCount, na.rm = TRUE),
+        .is_outlier = NormalizedCount < (.Q1 - outlier_coefficient * .IQR) |
+          NormalizedCount > (.Q3 + outlier_coefficient * .IQR)
+      ) %>%
+      dplyr::ungroup()
+
+    removed_outliers <- plot_df %>%
+      dplyr::filter(.is_outlier) %>%
+      dplyr::select(-.Q1, -.Q3, -.IQR, -.is_outlier)
+
+    plot_df <- plot_df %>%
+      dplyr::filter(!.is_outlier) %>%
+      dplyr::select(-.Q1, -.Q3, -.IQR, -.is_outlier)
+
+    cat(
+      "\n", gene_id, ": removed ", nrow(removed_outliers),
+      " outlier(s) using the ", outlier_coefficient,
+      " x IQR rule within Line x CO2 x Nitrogen groups",
+      if (nrow(removed_outliers) > 0) {
+        paste0(": ", paste(removed_outliers$Sample, collapse = ", "))
+      } else {
+        "."
+      },
+      "\n",
+      sep = ""
+    )
+  }
+
+  if (nrow(plot_df) == 0) {
+    warning("No observations remain after filtering for: ", gene_id)
+    return(NULL)
+  }
+
+  trend <- plot_df %>%
+    dplyr::group_by(Line, CO2, Nitrogen_mM) %>%
+    dplyr::summarise(
+      MeanNormalizedCount = mean(NormalizedCount),
+      SDNormalizedCount = sd(NormalizedCount),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      SDNormalizedCount = dplyr::if_else(
+        is.na(SDNormalizedCount) | is.nan(SDNormalizedCount),
+        0,
+        SDNormalizedCount
+      )
+    )
+
+  co2_colors <- c(AC = "cadetblue2", EC = "cadetblue4")
+  extra_co2 <- setdiff(levels(droplevels(plot_df$CO2)), names(co2_colors))
+  if (length(extra_co2) > 0) {
+    co2_colors <- c(
+      co2_colors,
+      stats::setNames(grDevices::hcl.colors(length(extra_co2), "Dark 3"), extra_co2)
+    )
+  }
+
+  nitrogen_breaks <- sort(unique(plot_df$Nitrogen_mM))
+
+  gene_plot <- ggplot(
+    trend,
+    aes(
+      x = Nitrogen_mM,
+      y = MeanNormalizedCount,
+      color = CO2,
+      group = CO2
+    )
+  ) +
+    geom_errorbar(
+      aes(
+        ymin = pmax(MeanNormalizedCount - SDNormalizedCount, 0),
+        ymax = MeanNormalizedCount + SDNormalizedCount
+      ),
+      width = 0.15,
+      linewidth = 0.55
+    ) +
+    geom_point(
+      data = plot_df,
+      aes(x = Nitrogen_mM, y = NormalizedCount, color = CO2),
+      inherit.aes = FALSE,
+      size = sample_point_size,
+      alpha = sample_point_alpha
+    ) +
+    geom_smooth(
+      method = "loess",
+      formula = y ~ x,
+      span = smooth_span,
+      se = FALSE,
+      linewidth = line_width
+    ) +
+    scale_color_manual(name = expression(CO[2]), values = co2_colors) +
+    scale_x_continuous(
+      breaks = nitrogen_breaks,
+      labels = function(x) format(x, trim = TRUE, drop0trailing = TRUE)
+    ) +
+    facet_wrap(~ Line) +
+    labs(
+      title = gene_id,
+      x = "Nitrogen (mM)",
+      y = "DESeq2 normalized count"
+    ) +
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold"),
+      panel.grid = element_blank(),
+      axis.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+
+  if (print_anova) {
+    anova_df <- plot_df %>%
+      dplyr::mutate(Line = droplevels(Line), CO2 = droplevels(CO2))
+
+    if (
+      nrow(anova_df) >= 3L &&
+      nlevels(anova_df$Line) > 1L &&
+      nlevels(anova_df$CO2) > 1L &&
+      dplyr::n_distinct(anova_df$Nitrogen_mM) > 1L
+    ) {
+      cat(
+        "\n## ", gene_id,
+        " ANOVA - Line x N (numeric) x CO2\n\n",
+        sep = ""
+      )
+      print(summary(stats::aov(
+        NormalizedCount ~ Line * Nitrogen_mM * CO2,
+        data = anova_df
+      )))
+
+      for (line_name in levels(anova_df$Line)) {
+        line_df <- dplyr::filter(anova_df, Line == line_name)
+        if (
+          nrow(line_df) < 3L ||
+          nlevels(droplevels(line_df$CO2)) < 2L ||
+          dplyr::n_distinct(line_df$Nitrogen_mM) < 2L
+        ) {
+          next
+        }
+        cat(
+          "\n## ", gene_id, " ANOVA - Line: ", line_name,
+          " (N numeric x CO2)\n\n",
+          sep = ""
+        )
+        print(summary(stats::aov(
+          NormalizedCount ~ Nitrogen_mM * CO2,
+          data = line_df
+        )))
+      }
+    } else {
+      cat("\n## ", gene_id, " ANOVA skipped: insufficient replication\n\n", sep = "")
+    }
+  }
+
+  safe_gene_id <- gsub("[^A-Za-z0-9_-]", "_", gene_id)
+  readr::write_csv(
+    plot_df,
+    file.path(plot_output_dir, paste0(safe_gene_id, "_normalized_counts.csv"))
+  )
+  if (nrow(removed_outliers) > 0) {
+    readr::write_csv(
+      removed_outliers,
+      file.path(plot_output_dir, paste0(safe_gene_id, "_removed_outliers.csv"))
+    )
+  }
+
+  if (save_plot) {
+    plot_file <- file.path(
+      plot_output_dir,
+      paste0(safe_gene_id, "_normalized_count_plot.png")
+    )
+    ggsave(
+      plot_file,
+      plot = gene_plot,
+      width = 7,
+      height = 4.5,
+      units = "in",
+      dpi = 300
+    )
+    cat("Saved gene-expression plot to: ", plot_file, "\n", sep = "")
+  }
+
+  gene_plot
+}
+```
+
+### Generate plots
+
+```{r expression-plot-genes, fig.width=7, fig.height=4.5}
+genes_of_interest <- c("MtrunA17_Chr5g0417791","MtrunA17_Chr8g0359921","MtrunA17_Chr3g0124761"
+)
+
+gene_expression_plots <- stats::setNames(
+  lapply(
+    genes_of_interest,
+    function(gene_id) {
+      plot_normalized_gene(
+        gene_id,
+        nitrogen_levels = c(2.5,5, 10, 20),
+        print_anova = TRUE,
+        save_plot = TRUE
+      )
+    }
+  ),
+  genes_of_interest
+)
+
+for (gene_plot in gene_expression_plots) {
+  if (!is.null(gene_plot)) {
+    print(gene_plot)
+  }
+}
+```
+
+# DEG expression heatmaps
+
+## Purpose
+
+This notebook plots selected shoot DEGs in eight biologically motivated
+sections. Every selected gene must have a significant genotype coefficient
+(`Line_sunn_vs_A17`, adjusted \(p < 0.05\)). The protein U-box/MAPK and
+autophagy groups are required to be lower in `sunn`, whereas the ribosome and
+chromatin/DNA-replication groups are required to be higher in `sunn`.
+
+The significant-DEG table defines the gene list. Expression values are then
+obtained from the shoot DESeq2 object and summarized across experimental
+conditions.
+
+```{r heatmap-setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+
+required_packages <- c(
+  "ComplexHeatmap", "DESeq2", "dplyr", "ggplot2", "here", "pheatmap",
+  "readr", "scales", "stringr", "SummarizedExperiment", "tibble", "tidyr"
+)
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the required package(s) before knitting: ",
+    paste(missing_packages, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(ggplot2)
+  library(here)
+  library(readr)
+  library(stringr)
+  library(tibble)
+  library(tidyr)
+})
+```
+
+## Inputs and output directory
+
+```{r heatmap-paths}
+deg_file <- file.path(in_dir, "DEG_analysis", "DEG_all_coefficients_combined.csv"
+)
+dds_file <- file.path(in_dir, "DEG_analysis", "dds_shoot.rds")
+output_dir <- file.path(expression_out_dir, "DEG_heatmap")
+
+missing_input_files <- c(deg_file, dds_file)[
+  !file.exists(c(deg_file, dds_file))
+]
+if (length(missing_input_files) > 0L) {
+  stop(
+    "Required input file(s) not found: ",
+    paste(missing_input_files, collapse = ", "),
+    call. = FALSE
+  )
+}
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Curated gene list
+
+The selected SWEET-family gene is labelled `SWEET-like` because the project
+annotation calls it a "putative SWEET sugar transporter" but does not assign
+the specific name `MtSWEET2c`. Additional Line-significant sugar transporters
+are included to provide context.
+
+```{r heatmap-gene-catalog}
+gene_catalog <- tribble(
+  ~section, ~gene, ~display_name, ~selection_coef,
+
+  "Photosynthesis",
+  "MtrunA17_Chr7g0242831", "Chlorophyll synthase", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr3g0103441", "RbcX", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr4g0003221", "Rubisco activase-like", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr3g0108671", "Ycf54", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr6g0453151", "Chlorophyll A-B binding protein", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr4g0015471", "Photosystem II protein", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr7g0249261", "Photosystem I protein", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr4g0051941", "Chlorophyll A-B binding protein 1", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr6g0453141", "Chlorophyll A-B binding protein 2", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr2g0318521", "Chlorophyll A-B binding protein 3", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr1g0205431", "Photosystem II Psb27", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr3g0138501", "Photosystem II protein 2", "Line_sunn_vs_A17",
+  "Photosynthesis",
+  "MtrunA17_Chr4g0026061", "Photosystem I protein 2", "Line_sunn_vs_A17",
+
+  "Carbon Transporter",
+  "MtrunA17_Chr2g0314571", "SWEET-like sugar transporter", "Line_sunn_vs_A17",
+  "Carbon Transporter",
+  "MtrunA17_Chr3g0144361", "MtPMT5_1 / MtPLT1.2", "Line_sunn_vs_A17",
+  "Carbon Transporter",
+  "MtrunA17_Chr6g0486671", "MtSTP14_1 / MtSTP14.2", "Line_sunn_vs_A17",
+  "Carbon Transporter",
+  "MtrunA17_Chr5g0420841", "MtSTP1_6 / MtSTP1.4", "Line_sunn_vs_A17",
+  "Carbon Transporter",
+  "MtrunA17_Chr7g0259221", "MtESL7 / MtESL2.1", "Line_sunn_vs_A17",
+  "Carbon Transporter",
+  "MtrunA17_Chr4g0032021", "MtVGT1.2", "Line_sunn_vs_A17",
+  "Carbon Transporter",
+  "MtrunA17_Chr3g0119401", "MtpGlcT1 / MtSGB1.3", "Line_sunn_vs_A17",
+  "Carbon Transporter",
+  "MtrunA17_Chr4g0065324", "MtSTP7_6", "Line_sunn_vs_A17",
+
+  "Nitrate Uptake",
+  "MtrunA17_Chr4g0060071", "MtNPF4.6", "Line_sunn_vs_A17",
+  "Nitrate Uptake",
+  "MtrunA17_Chr7g0240381", "MtNPF5.18", "Line_sunn_vs_A17",
+  "Nitrate Uptake",
+  "MtrunA17_Chr6g0451841", "MtNPF5.24", "Line_sunn_vs_A17",
+  "Nitrate Uptake",
+  "MtrunA17_Chr5g0399071", "MtNPF6.7", "Line_sunn_vs_A17",
+
+  "Nitrogen Signaling",
+  "MtrunA17_Chr1g0195981", "MtCEPD1", "Line_sunn_vs_A17",
+  "Nitrogen Signaling",
+  "MtrunA17_Chr1g0195991", "MtCEPD2", "Line_sunn_vs_A17",
+  "Nitrogen Signaling",
+  "MtrunA17_Chr2g0329671", "MtNLP3", "Line_sunn_vs_A17",
+
+  "Plant U-box and MAPK",
+  "MtrunA17_Chr7g0234671", "MtPUB50", "Line_sunn_vs_A17",
+  "Plant U-box and MAPK",
+  "MtrunA17_Chr3g0079051", "MtPUB21", "Line_sunn_vs_A17",
+  "Plant U-box and MAPK",
+  "MtrunA17_Chr5g0400971", "MtPUB38", "Line_sunn_vs_A17",
+  "Plant U-box and MAPK",
+  "MtrunA17_Chr4g0070941", "MtPUB36", "Line_sunn_vs_A17",
+  "Plant U-box and MAPK",
+  "MtrunA17_Chr1g0188041", "MtPUB7", "Line_sunn_vs_A17",
+  "Plant U-box and MAPK",
+  "MtrunA17_Chr6g0449691", "MtMAPKK3", "Line_sunn_vs_A17",
+
+  "Autophagy",
+  "MtrunA17_Chr1g0191361", "MtATG18h", "Line_sunn_vs_A17",
+  "Autophagy",
+  "MtrunA17_Chr4g0056301", "MtATG8e", "Line_sunn_vs_A17",
+  "Autophagy",
+  "MtrunA17_Chr7g0250241", "MtATG4", "Line_sunn_vs_A17",
+  "Autophagy",
+  "MtrunA17_Chr4g0020251", "MtATG7", "Line_sunn_vs_A17",
+  "Autophagy",
+  "MtrunA17_Chr4g0018531", "MtATG3", "Line_sunn_vs_A17",
+  "Autophagy",
+  "MtrunA17_Chr4g0073631", "MtATG11", "Line_sunn_vs_A17",
+
+  "Ribosomal Proteins",
+  "MtrunA17_Chr8g0347691", "MtRPuL5 (uL5)", "Line_sunn_vs_A17",
+  "Ribosomal Proteins",
+  "MtrunA17_Chr5g0405281", "MtRPuL2B (uL2)", "Line_sunn_vs_A17",
+
+  "Chromatin and DNA Replication",
+  "MtrunA17_Chr5g0393401", "MtHDA9", "Line_sunn_vs_A17",
+  "Chromatin and DNA Replication",
+  "MtrunA17_Chr2g0320884", "MtHDT2", "Line_sunn_vs_A17",
+  "Chromatin and DNA Replication",
+  "MtrunA17_Chr5g0435791", "MtHAM2", "Line_sunn_vs_A17",
+  "Chromatin and DNA Replication",
+  "MtrunA17_Chr3g0128471", "MtHAG14", "Line_sunn_vs_A17",
+  "Chromatin and DNA Replication",
+  "MtrunA17_Chr8g0375381", "ASHR2-2", "Line_sunn_vs_A17",
+  "Chromatin and DNA Replication",
+  "MtrunA17_Chr3g0138771", "MtPRMT2", "Line_sunn_vs_A17",
+  "Chromatin and DNA Replication",
+  "MtrunA17_Chr4g0035581", "MCM2-like4", "Line_sunn_vs_A17",
+  "Chromatin and DNA Replication",
+  "MtrunA17_Chr8g0381871", "MCM2-like5", "Line_sunn_vs_A17"
+) %>%
+  mutate(
+    section = factor(
+      section,
+      levels = c(
+        "Photosynthesis", "Carbon Transporter",
+        "Nitrate Uptake", "Nitrogen Signaling",
+        "Plant U-box and MAPK", "Autophagy", "Ribosomal Proteins",
+        "Chromatin and DNA Replication"
+      )
+    ),
+    expected_line_direction = case_when(
+      section %in% c("Plant U-box and MAPK", "Autophagy") ~ "Down in sunn",
+      section %in% c(
+        "Ribosomal Proteins", "Chromatin and DNA Replication"
+      ) ~ "Up in sunn",
+      TRUE ~ "Either"
+    ),
+    gene_order = row_number(),
+    display_label = paste0(display_name, " (", gene, ")")
+  )
+
+if (anyDuplicated(gene_catalog$gene)) {
+  stop("The curated gene catalog contains duplicate gene IDs.", call. = FALSE)
+}
+```
+
+## Read DEGs and enforce selection rules
+
+```{r heatmap-prepare-data}
+required_columns <- c(
+  "coef", "gene", "gene_name", "gene_product", "log2FoldChange", "padj"
+)
+
+deg <- read_csv(
+  deg_file,
+  col_types = cols(
+    coef = col_character(),
+    gene = col_character(),
+    gene_name = col_character(),
+    gene_product = col_character(),
+    log2FoldChange = col_double(),
+    padj = col_double()
+  ),
+  show_col_types = FALSE
+)
+
+missing_columns <- setdiff(required_columns, names(deg))
+if (length(missing_columns) > 0L) {
+  stop(
+    "The DEG file is missing column(s): ",
+    paste(missing_columns, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+## Apply the adjusted-p threshold defensively even though the source file is
+## expected to contain significant DEGs only.
+significant_deg <- deg %>%
+  filter(!is.na(gene), gene != "", !is.na(padj), padj < 0.05) %>%
+  distinct(coef, gene, .keep_all = TRUE)
+
+selection_audit <- gene_catalog %>%
+  left_join(
+    significant_deg %>%
+      dplyr::select(
+        gene, selection_coef = coef,
+        selection_log2FoldChange = log2FoldChange,
+        selection_padj = padj
+      ),
+    by = c("gene", "selection_coef")
+  ) %>%
+  mutate(
+    passes_padj = !is.na(selection_padj) & selection_padj < 0.05,
+    passes_direction = case_when(
+      expected_line_direction == "Down in sunn" ~
+        selection_log2FoldChange < 0,
+      expected_line_direction == "Up in sunn" ~
+        selection_log2FoldChange > 0,
+      TRUE ~ TRUE
+    ),
+    passes_selection = passes_padj & passes_direction
+  )
+
+failed_selection <- selection_audit %>% filter(!passes_selection)
+if (nrow(failed_selection) > 0L) {
+  stop(
+    "Selected gene(s) no longer pass their required coefficient criterion: ",
+    paste(
+      paste0(failed_selection$display_name, " [", failed_selection$gene, "]"),
+      collapse = ", "
+    ),
+    call. = FALSE
+  )
+}
+
+write_csv(
+  selection_audit %>%
+    arrange(section, gene_order) %>%
+    dplyr::select(
+      section, gene, display_name, selection_coef,
+      expected_line_direction, selection_log2FoldChange, selection_padj,
+      passes_padj, passes_direction, passes_selection
+    ),
+  file.path(output_dir, "selected_gene_selection_audit.csv")
+)
+```
+
+## Build the gene-expression heatmap
+
+The DEG table is used only to select genes with a significant Line effect.
+Heatmap values come from DESeq2-normalized counts in `dds_shoot.rds`.
+Replicates are averaged within each Line, CO2, and nitrogen condition. The
+displayed value is a row Z-score of the log2-transformed condition mean, so
+colors show each gene's relative expression pattern rather than fold changes
+between model coefficients.
+
+```{r heatmap-expression-heatmap-data}
+## Work around missing ExpData registration in affected Bioconductor versions.
+if (!methods::isClass("ExpData")) {
+  methods::setClassUnion("ExpData", c("matrix", "SummarizedExperiment"))
+}
+
+dds_shoot <- readRDS(dds_file)
+missing_expression_genes <- setdiff(
+  gene_catalog$gene,
+  rownames(dds_shoot)
+)
+if (length(missing_expression_genes) > 0L) {
+  stop(
+    "Selected gene(s) absent from dds_shoot.rds: ",
+    paste(missing_expression_genes, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+sample_metadata <- as.data.frame(
+  SummarizedExperiment::colData(dds_shoot)
+) %>%
+  tibble::rownames_to_column("sample") %>%
+  dplyr::transmute(
+    sample,
+    Line = factor(as.character(Line), levels = c("A17", "sunn")),
+    CO2 = factor(as.character(CO2), levels = c("AC", "EC")),
+    Nitrogen = as.numeric(as.character(Nitrogen))
+  ) %>%
+  dplyr::filter(!is.na(Line), !is.na(CO2), is.finite(Nitrogen))
+
+normalized_count_matrix <- DESeq2::counts(dds_shoot, normalized = TRUE)[
+  gene_catalog$gene,
+  sample_metadata$sample,
+  drop = FALSE
+]
+
+condition_key <- sample_metadata %>%
+  dplyr::distinct(Line, CO2, Nitrogen) %>%
+  dplyr::arrange(Line, CO2, Nitrogen) %>%
+  dplyr::mutate(
+    condition = paste(Line, CO2, Nitrogen, sep = "_"),
+    condition_label = paste0(
+      Line, "\n", CO2, "\n", format(Nitrogen, trim = TRUE), " mM N"
+    ),
+    condition_order = dplyr::row_number()
+  )
+
+expression_heatmap_data <- normalized_count_matrix %>%
+  as.data.frame(check.names = FALSE) %>%
+  tibble::rownames_to_column("gene") %>%
+  tidyr::pivot_longer(
+    cols = -gene,
+    names_to = "sample",
+    values_to = "normalized_count"
+  ) %>%
+  dplyr::inner_join(sample_metadata, by = "sample") %>%
+  dplyr::group_by(gene, Line, CO2, Nitrogen) %>%
+  dplyr::summarise(
+    mean_normalized_count = mean(normalized_count, na.rm = TRUE),
+    replicate_n = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    condition = paste(Line, CO2, Nitrogen, sep = "_"),
+    log2_mean_expression = log2(mean_normalized_count + 1)
+  ) %>%
+  dplyr::group_by(gene) %>%
+  dplyr::mutate(
+    gene_mean = mean(log2_mean_expression, na.rm = TRUE),
+    gene_sd = stats::sd(log2_mean_expression, na.rm = TRUE),
+    expression_z_score = dplyr::if_else(
+      is.finite(gene_sd) & gene_sd > 0,
+      (log2_mean_expression - gene_mean) / gene_sd,
+      0
+    )
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(gene_catalog, by = "gene") %>%
+  dplyr::left_join(
+    condition_key %>%
+      dplyr::select(condition, condition_label, condition_order),
+    by = "condition"
+  ) %>%
+  dplyr::mutate(
+    section = factor(section, levels = levels(gene_catalog$section)),
+    display_label = factor(
+      display_label,
+      levels = rev(gene_catalog$display_label)
+    ),
+    condition_label = factor(
+      condition_label,
+      levels = condition_key$condition_label
+    )
+  ) %>%
+  dplyr::arrange(section, gene_order, condition_order)
+
+write_csv(
+  expression_heatmap_data %>%
+    dplyr::mutate(
+      section = as.character(section),
+      display_label = as.character(display_label),
+      condition_label = as.character(condition_label)
+    ) %>%
+    dplyr::select(
+      section, gene, display_name, Line, CO2, Nitrogen, condition_label,
+      replicate_n, mean_normalized_count, log2_mean_expression,
+      expression_z_score
+    ),
+  file.path(output_dir, "selected_DEG_expression_heatmap_data.csv"),
+  na = ""
+)
+```
+
+```{r heatmap-prepare-grouped-expression-heatmaps}
+full_heatmap_matrix <- expression_heatmap_data %>%
+  dplyr::transmute(
+    display_label = as.character(display_label),
+    condition_label = as.character(condition_label),
+    expression_z_score
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = condition_label,
+    values_from = expression_z_score
+  ) %>%
+  tibble::column_to_rownames("display_label") %>%
+  as.matrix()
+
+## Keep experimental conditions in a meaningful order instead of clustering
+## columns. Colored annotation bars identify Line, CO2, and nitrogen treatment.
+full_heatmap_matrix <- full_heatmap_matrix[
+  gene_catalog$display_label,
+  condition_key$condition_label,
+  drop = FALSE
+]
+
+column_annotation <- condition_key %>%
+  dplyr::transmute(
+    condition_label,
+    Line = factor(as.character(Line), levels = c("A17", "sunn")),
+    CO2 = factor(as.character(CO2), levels = c("AC", "EC")),
+    Nitrogen = factor(
+      format(Nitrogen, trim = TRUE),
+      levels = format(sort(unique(Nitrogen)), trim = TRUE)
+    )
+  ) %>%
+  tibble::column_to_rownames("condition_label") %>%
+  as.data.frame()
+column_annotation <- column_annotation[
+  colnames(full_heatmap_matrix),
+  ,
+  drop = FALSE
+]
+
+classification_levels <- levels(gene_catalog$section)
+annotation_colors <- list(
+  Line = c(A17 = "#DEE757", sunn = "#F1B856"),
+  CO2 = c(AC = "cadetblue2", EC = "cadetblue4"),
+  Nitrogen = setNames(
+    grDevices::colorRampPalette(c("#B7E4C7", "#1B4332"))(
+      nlevels(column_annotation$Nitrogen)
+    ),
+    levels(column_annotation$Nitrogen)
+  ),
+  Classification = setNames(
+    grDevices::hcl.colors(
+      length(classification_levels),
+      palette = "Dark 3"
+    ),
+    classification_levels
+  )
+)
+
+heatmap_colors <- grDevices::colorRampPalette(
+  c("#327DB7", "#F7F7F7", "#B71C2C")
+)(101)
+heatmap_breaks <- seq(-2.5, 2.5, length.out = 102)
+
+make_expression_heatmap <- function(selected_sections, output_stem) {
+  section_catalog <- gene_catalog %>%
+    dplyr::filter(as.character(section) %in% selected_sections) %>%
+    dplyr::mutate(
+      section = factor(as.character(section), levels = selected_sections)
+    ) %>%
+    dplyr::arrange(section, gene_order)
+
+  if (nrow(section_catalog) == 0L) {
+    stop("No genes found for: ", paste(selected_sections, collapse = ", "))
+  }
+
+  heatmap_matrix <- full_heatmap_matrix[
+    section_catalog$display_label,
+    ,
+    drop = FALSE
+  ]
+
+  # Cluster rows separately within each classification.
+  clustered_gene_labels <- unlist(
+    lapply(
+      selected_sections,
+      function(section_name) {
+        section_labels <- section_catalog %>%
+          dplyr::filter(as.character(section) == section_name) %>%
+          dplyr::pull(display_label)
+
+        if (length(section_labels) <= 1L) {
+          return(section_labels)
+        }
+
+        section_matrix <- heatmap_matrix[
+          section_labels,
+          ,
+          drop = FALSE
+        ]
+        section_labels[
+          stats::hclust(stats::dist(section_matrix))$order
+        ]
+      }
+    ),
+    use.names = FALSE
+  )
+  heatmap_matrix <- heatmap_matrix[
+    clustered_gene_labels,
+    ,
+    drop = FALSE
+  ]
+
+  row_annotation <- section_catalog %>%
+    dplyr::transmute(
+      display_label,
+      Classification = factor(
+        as.character(section),
+        levels = selected_sections
+      )
+    ) %>%
+    tibble::column_to_rownames("display_label") %>%
+    as.data.frame()
+  row_annotation <- row_annotation[
+    rownames(heatmap_matrix),
+    ,
+    drop = FALSE
+  ]
+
+  class_sizes <- table(row_annotation$Classification)
+  row_gaps <- head(cumsum(as.integer(class_sizes)), -1L)
+  line_gap <- sum(column_annotation$Line == "A17")
+
+  heatmap_plot <- pheatmap::pheatmap(
+    heatmap_matrix,
+    scale = "none",
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    gaps_row = row_gaps,
+    gaps_col = line_gap,
+    annotation_row = row_annotation,
+    annotation_col = column_annotation,
+    annotation_colors = annotation_colors,
+    annotation_names_row = TRUE,
+    annotation_names_col = TRUE,
+    color = heatmap_colors,
+    breaks = heatmap_breaks,
+    border_color = NA,
+    show_rownames = TRUE,
+    show_colnames = FALSE,
+    fontsize_row = 7,
+    fontsize_col = 7,
+    angle_col = 45,
+    silent = TRUE
+  )
+
+  plot_height <- max(8, 4 + 0.33 * nrow(section_catalog))
+
+  grDevices::pdf(
+    file.path(output_dir, paste0(output_stem, ".pdf")),
+    width = 13,
+    height = plot_height
+  )
+  grid::grid.newpage()
+  grid::grid.draw(heatmap_plot$gtable)
+  grDevices::dev.off()
+
+  grDevices::png(
+    file.path(output_dir, paste0(output_stem, ".png")),
+    width = 13,
+    height = plot_height,
+    units = "in",
+    res = 300
+  )
+  grid::grid.newpage()
+  grid::grid.draw(heatmap_plot$gtable)
+  grDevices::dev.off()
+
+  heatmap_plot
+}
+
+pathway_sections <- c(
+  "Photosynthesis", "Carbon Transporter",
+  "Nitrate Uptake", "Nitrogen Signaling"
+)
+cellular_process_sections <- setdiff(
+  levels(gene_catalog$section),
+  pathway_sections
+)
+```
+
+### Figure 1: Photosynthesis, transport, and nitrogen
+
+```{r heatmap-pathway-expression-heatmap, fig.width=13, fig.height=13}
+pathway_heatmap <- make_expression_heatmap(
+  pathway_sections,
+  "selected_DEG_expression_heatmap_pathways"
+)
+grid::grid.newpage()
+grid::grid.draw(pathway_heatmap$gtable)
+```
+
+### Figure 2: Cellular processes
+
+```{r heatmap-cellular-process-expression-heatmap, fig.width=13, fig.height=13}
+cellular_process_heatmap <- make_expression_heatmap(
+  cellular_process_sections,
+  "selected_DEG_expression_heatmap_cellular_processes"
+)
+grid::grid.newpage()
+grid::grid.draw(cellular_process_heatmap$gtable)
+```
+
+## Selected genes
+
+```{r heatmap-selected-gene-table}
+selection_audit %>%
+  arrange(section, gene_order) %>%
+  transmute(
+    Section = as.character(section),
+    Gene = display_name,
+    `Gene ID` = gene,
+    `Required coefficient` = selection_coef,
+    `Expected Line direction` = expected_line_direction,
+    `log2 fold change` = round(selection_log2FoldChange, 3),
+    `Adjusted p` = format(selection_padj, scientific = TRUE, digits = 3)
+  ) %>%
+  knitr::kable()
+```
+
+## WGCNA module membership
+
+Shoot WGCNA module colors come from
+`Data/data_for_publication/WGCNA_analysis/gene_module_assignment_annotated.csv`. Only genes in the
+BNF-related modules are kept: red, green, turquoise, magenta, cyan,
+midnightblue, lightcyan, and pink. Direction is the sign of the significant
+`Line_sunn_vs_A17` log2 fold change.
+
+```{r heatmap-deg-wgcna-module-table}
+module_file <- file.path(in_dir, "WGCNA_analysis", "gene_module_assignment_annotated.csv"
+)
+if (!file.exists(module_file)) {
+  stop("WGCNA module assignment file not found: ", module_file, call. = FALSE)
+}
+
+bnf_modules <- c(
+  "red", "green", "turquoise", "magenta", "cyan",
+  "midnightblue", "lightcyan", "pink"
+)
+
+gene_modules <- read_csv(
+  module_file,
+  col_types = cols(
+    gene = col_character(),
+    gene_name = col_character(),
+    gene_product = col_character(),
+    module = col_character()
+  ),
+  show_col_types = FALSE
+) %>%
+  distinct(gene, .keep_all = TRUE)
+
+deg_module_table <- selection_audit %>%
+  arrange(section, gene_order) %>%
+  left_join(
+    gene_modules %>%
+      dplyr::select(
+        gene,
+        wgcna_module = module,
+        annotated_gene_name = gene_name,
+        annotated_gene_product = gene_product
+      ),
+    by = "gene"
+  ) %>%
+  mutate(
+    wgcna_module = if_else(
+      is.na(wgcna_module) | wgcna_module == "",
+      "not assigned",
+      wgcna_module
+    ),
+    line_direction = if_else(
+      selection_log2FoldChange < 0,
+      "Down in sunn",
+      "Up in sunn"
+    )
+  ) %>%
+  filter(wgcna_module %in% bnf_modules)
+
+write_csv(
+  deg_module_table %>%
+    transmute(
+      section = as.character(section),
+      gene,
+      display_name,
+      wgcna_module,
+      line_direction,
+      log2FoldChange = selection_log2FoldChange,
+      padj = selection_padj
+    ),
+  file.path(output_dir, "selected_DEG_WGCNA_modules.csv")
+)
+
+deg_module_table %>%
+  transmute(
+    Section = as.character(section),
+    Gene = display_name,
+    `Gene ID` = gene,
+    `WGCNA module` = wgcna_module,
+    Direction = line_direction,
+    `log2 fold change` = round(selection_log2FoldChange, 3)
+  ) %>%
+  knitr::kable(
+    caption = "Selected DEGs that belong to BNF-related WGCNA modules"
+  )
+```
+
+```{r heatmap-deg-wgcna-module-summary}
+deg_module_table %>%
+  mutate(section = as.character(section)) %>%
+  count(section, line_direction, wgcna_module, name = "n_genes") %>%
+  group_by(section, line_direction) %>%
+  summarise(
+    `WGCNA modules` = paste0(wgcna_module, " (", n_genes, ")", collapse = "; "),
+    `n genes` = sum(n_genes),
+    .groups = "drop"
+  ) %>%
+  rename(
+    Section = section,
+    Direction = line_direction
+  ) %>%
+  knitr::kable(
+    caption = "BNF-module DEGs summarized by functional group"
+  )
+```
+
+### Other annotated genes in the same modules
+
+These genes are not in the curated heatmaps above. A gene is kept when it has
+a gene name, a significant Line effect, and membership in a BNF-related
+module, and when either the absolute log2 fold change is at least 1 or its
+name matches the same families already highlighted (nitrate and nitrogen
+signaling, autophagy, U-box, MAPK, cytokinin, nodulation, chromatin, or DNA
+replication). The heatmap below uses a selected subset of these genes.
+
+```{r heatmap-additional-bnf-annotated-degs}
+family_pattern <- paste(
+  "NPF", "NLP", "CEPD", "ATG", "PUB", "MAPK", "MCM", "ORC[0-9]",
+  "HAG[0-9]", "HDA[0-9]", "HDT[0-9]", "SDG[0-9]", "CMT[0-9]", "FIE",
+  "LOG-like", "CRE1", "CHK1", "NAC[0-9]", "NF-YA", "NodGRP", "ENOD",
+  "CLE[0-9]", "GS1", "RRA[0-9]", "RRB[0-9]",
+  sep = "|"
+)
+
+additional_bnf_genes <- significant_deg %>%
+  filter(coef == "Line_sunn_vs_A17", !gene %in% gene_catalog$gene) %>%
+  inner_join(
+    gene_modules %>%
+      filter(module %in% bnf_modules) %>%
+      dplyr::select(
+        gene,
+        wgcna_module = module,
+        annotated_gene_name = gene_name,
+        annotated_gene_product = gene_product
+      ),
+    by = "gene"
+  ) %>%
+  mutate(
+    annotated_gene_name = str_trim(annotated_gene_name),
+    annotated_gene_product = str_trim(annotated_gene_product)
+  ) %>%
+  filter(
+    !is.na(annotated_gene_name),
+    annotated_gene_name != ""
+  ) %>%
+  mutate(
+    matches_highlighted_family = str_detect(
+      paste(annotated_gene_name, annotated_gene_product),
+      family_pattern
+    ),
+    strong_line_effect = abs(log2FoldChange) >= 1
+  ) %>%
+  filter(matches_highlighted_family | strong_line_effect) %>%
+  mutate(
+    why_kept = case_when(
+      matches_highlighted_family & strong_line_effect ~
+        "Same family and |log2FC| >= 1",
+      matches_highlighted_family ~ "Same highlighted gene family",
+      TRUE ~ "|log2FC| >= 1"
+    ),
+    line_direction = if_else(log2FoldChange < 0, "Down in sunn", "Up in sunn")
+  ) %>%
+  arrange(wgcna_module, log2FoldChange)
+
+write_csv(
+  additional_bnf_genes %>%
+    transmute(
+      gene,
+      gene_name = annotated_gene_name,
+      gene_product = annotated_gene_product,
+      wgcna_module,
+      line_direction,
+      log2FoldChange,
+      padj,
+      why_kept
+    ),
+  file.path(output_dir, "additional_BNF_module_annotated_DEGs.csv")
+)
+
+additional_bnf_genes %>%
+  transmute(
+    Gene = annotated_gene_name,
+    Product = annotated_gene_product,
+    `WGCNA module` = wgcna_module,
+    Direction = line_direction,
+    `log2 fold change` = round(log2FoldChange, 3),
+    `Adjusted p` = format(padj, scientific = TRUE, digits = 3),
+    Reason = why_kept
+  ) %>%
+  knitr::kable(
+    caption = "Other annotated Line DEGs in BNF-related WGCNA modules"
+  )
+```
+
+## BNF-module expression heatmap
+
+Colors are row Z-scores of log2 expression, averaged within each Line, CO2,
+and nitrogen condition. The MtNPF transporters and MtGS1a form the nitrogen
+assimilation group. MtCLE03, MtNLP3, MtCEPD1, MtCEPD2, and MtCHK1/MtCRE1 form
+the nodule development and signaling group. Rows are clustered within each
+group. A color strip on the left marks the WGCNA module of each gene, and the
+legends are drawn in a horizontal row above the heatmap.
+
+```{r heatmap-bnf-module-expression-heatmap, fig.width=14, fig.height=12}
+final_heatmap_gene_ids <- c(
+  "MtrunA17_Chr7g0242831", "MtrunA17_Chr3g0108671", "MtrunA17_Chr3g0103441",
+  "MtrunA17_Chr1g0205431", "MtrunA17_Chr3g0138501",
+  "MtrunA17_Chr7g0240381", "MtrunA17_Chr5g0399071", "MtrunA17_Chr4g0060071",
+  "MtrunA17_Chr6g0451841", "MtrunA17_Chr2g0329671",
+  "MtrunA17_Chr1g0195981", "MtrunA17_Chr1g0195991",
+  "MtrunA17_Chr1g0209831", "MtrunA17_Chr8g0392301",
+  "MtrunA17_Chr6g0479141"
+)
+
+bnf_heatmap_genes <- dplyr::bind_rows(
+  deg_module_table %>%
+    dplyr::transmute(
+      gene,
+      display_name,
+      wgcna_module,
+      log2FoldChange = selection_log2FoldChange,
+      source = "Heatmap list"
+    ),
+  additional_bnf_genes %>%
+    dplyr::transmute(
+      gene,
+      display_name = annotated_gene_name,
+      wgcna_module,
+      log2FoldChange,
+      source = "Additional annotated DEG"
+    ),
+  selection_audit %>%
+    dplyr::filter(!gene %in% deg_module_table$gene) %>%
+    dplyr::left_join(
+      gene_modules %>% dplyr::select(gene, wgcna_module = module),
+      by = "gene"
+    ) %>%
+    dplyr::transmute(
+      gene,
+      display_name,
+      wgcna_module,
+      log2FoldChange = selection_log2FoldChange,
+      source = "Heatmap list"
+    )
+) %>%
+  dplyr::filter(gene %in% final_heatmap_gene_ids) %>%
+  dplyr::distinct(gene, .keep_all = TRUE)
+
+missing_final_genes <- setdiff(final_heatmap_gene_ids, bnf_heatmap_genes$gene)
+if (length(missing_final_genes) > 0L) {
+  recovered_heatmap_genes <- significant_deg %>%
+    dplyr::filter(
+      coef == "Line_sunn_vs_A17",
+      gene %in% missing_final_genes
+    ) %>%
+    dplyr::left_join(
+      gene_modules %>%
+        dplyr::select(gene, wgcna_module = module, annotated_gene_name = gene_name),
+      by = "gene"
+    ) %>%
+    dplyr::transmute(
+      gene,
+      display_name = annotated_gene_name,
+      wgcna_module,
+      log2FoldChange,
+      source = "Additional annotated DEG"
+    )
+  bnf_heatmap_genes <- dplyr::bind_rows(
+    bnf_heatmap_genes,
+    recovered_heatmap_genes
+  )
+}
+missing_final_genes <- setdiff(final_heatmap_gene_ids, bnf_heatmap_genes$gene)
+if (length(missing_final_genes) > 0L) {
+  stop(
+    "Final heatmap gene(s) were not found: ",
+    paste(missing_final_genes, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+functional_group_levels <- c(
+  "Photosynthesis", "Nitrogen assimilation",
+  "Nodule development and signaling"
+)
+
+bnf_heatmap_genes <- bnf_heatmap_genes %>%
+  dplyr::mutate(
+    display_label = dplyr::if_else(
+      duplicated(display_name) | duplicated(display_name, fromLast = TRUE),
+      paste0(display_name, " (", gene, ")"),
+      display_name
+    ),
+    functional_group = dplyr::case_when(
+      gene %in% c(
+        "MtrunA17_Chr7g0242831", "MtrunA17_Chr3g0108671",
+        "MtrunA17_Chr3g0103441", "MtrunA17_Chr1g0205431",
+        "MtrunA17_Chr3g0138501"
+      ) ~ "Photosynthesis",
+      gene %in% c(
+        "MtrunA17_Chr7g0240381", "MtrunA17_Chr5g0399071",
+        "MtrunA17_Chr4g0060071", "MtrunA17_Chr6g0451841",
+        "MtrunA17_Chr6g0479141"
+      ) ~ "Nitrogen assimilation",
+      gene %in% c(
+        "MtrunA17_Chr1g0195981", "MtrunA17_Chr1g0195991",
+        "MtrunA17_Chr1g0209831", "MtrunA17_Chr2g0329671",
+        "MtrunA17_Chr8g0392301"
+      ) ~ "Nodule development and signaling",
+      TRUE ~ NA_character_
+    ),
+    functional_group = factor(functional_group, levels = functional_group_levels)
+  )
+
+if (anyNA(bnf_heatmap_genes$functional_group)) {
+  stop(
+    "Final heatmap gene(s) have no functional group: ",
+    paste(
+      bnf_heatmap_genes$gene[is.na(bnf_heatmap_genes$functional_group)],
+      collapse = ", "
+    ),
+    call. = FALSE
+  )
+}
+
+if (anyDuplicated(bnf_heatmap_genes$gene)) {
+  stop("BNF heatmap gene list contains duplicate gene IDs.", call. = FALSE)
+}
+if (anyDuplicated(bnf_heatmap_genes$display_label)) {
+  stop("BNF heatmap labels are not unique.", call. = FALSE)
+}
+
+missing_bnf_genes <- setdiff(bnf_heatmap_genes$gene, rownames(dds_shoot))
+if (length(missing_bnf_genes) > 0L) {
+  stop(
+    "BNF-module gene(s) absent from dds_shoot.rds: ",
+    paste(missing_bnf_genes, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+bnf_normalized_counts <- DESeq2::counts(dds_shoot, normalized = TRUE)[
+  bnf_heatmap_genes$gene,
+  sample_metadata$sample,
+  drop = FALSE
+]
+
+bnf_expression <- bnf_normalized_counts %>%
+  as.data.frame(check.names = FALSE) %>%
+  tibble::rownames_to_column("gene") %>%
+  tidyr::pivot_longer(
+    cols = -gene,
+    names_to = "sample",
+    values_to = "normalized_count"
+  ) %>%
+  dplyr::inner_join(sample_metadata, by = "sample") %>%
+  dplyr::group_by(gene, Line, CO2, Nitrogen) %>%
+  dplyr::summarise(
+    mean_normalized_count = mean(normalized_count, na.rm = TRUE),
+    replicate_n = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    condition = paste(Line, CO2, Nitrogen, sep = "_"),
+    log2_mean_expression = log2(mean_normalized_count + 1)
+  ) %>%
+  dplyr::group_by(gene) %>%
+  dplyr::mutate(
+    gene_mean = mean(log2_mean_expression, na.rm = TRUE),
+    gene_sd = stats::sd(log2_mean_expression, na.rm = TRUE),
+    expression_z_score = dplyr::if_else(
+      is.finite(gene_sd) & gene_sd > 0,
+      (log2_mean_expression - gene_mean) / gene_sd,
+      0
+    )
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(bnf_heatmap_genes, by = "gene") %>%
+  dplyr::left_join(
+    condition_key %>%
+      dplyr::select(condition, condition_label, condition_order),
+    by = "condition"
+  )
+
+write_csv(
+  bnf_expression %>%
+    dplyr::arrange(functional_group, display_label, condition_order) %>%
+    dplyr::select(
+      functional_group, gene, display_name, wgcna_module, log2FoldChange,
+      Line, CO2, Nitrogen, condition_label,
+      replicate_n, mean_normalized_count, log2_mean_expression,
+      expression_z_score
+    ),
+  file.path(output_dir, "BNF_module_DEG_expression_heatmap_data.csv"),
+  na = ""
+)
+
+bnf_heatmap_genes <- bnf_heatmap_genes %>%
+  dplyr::arrange(functional_group, display_label)
+
+bnf_heatmap_matrix <- bnf_expression %>%
+  dplyr::transmute(
+    display_label,
+    condition_label = as.character(condition_label),
+    expression_z_score
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = condition_label,
+    values_from = expression_z_score
+  ) %>%
+  tibble::column_to_rownames("display_label") %>%
+  as.matrix()
+bnf_heatmap_matrix <- bnf_heatmap_matrix[
+  bnf_heatmap_genes$display_label,
+  condition_key$condition_label,
+  drop = FALSE
+]
+
+present_groups <- functional_group_levels[
+  functional_group_levels %in% bnf_heatmap_genes$functional_group
+]
+clustered_bnf_labels <- unlist(
+  lapply(
+    present_groups,
+    function(group_name) {
+      group_labels <- bnf_heatmap_genes %>%
+        dplyr::filter(as.character(functional_group) == group_name) %>%
+        dplyr::pull(display_label)
+      if (length(group_labels) <= 1L) {
+        return(group_labels)
+      }
+      group_matrix <- bnf_heatmap_matrix[group_labels, , drop = FALSE]
+      group_labels[stats::hclust(stats::dist(group_matrix))$order]
+    }
+  ),
+  use.names = FALSE
+)
+bnf_heatmap_matrix <- bnf_heatmap_matrix[clustered_bnf_labels, , drop = FALSE]
+
+heatmap_row_meta <- bnf_heatmap_genes[
+  match(rownames(bnf_heatmap_matrix), bnf_heatmap_genes$display_label),
+  ,
+  drop = FALSE
+]
+module_levels_present <- bnf_modules[
+  bnf_modules %in% heatmap_row_meta$wgcna_module
+]
+module_colors <- stats::setNames(module_levels_present, module_levels_present)
+horizontal_legend <- list(
+  direction = "horizontal",
+  nrow = 1,
+  title_position = "topcenter"
+)
+
+bnf_left_annotation <- ComplexHeatmap::rowAnnotation(
+  Module = factor(
+    as.character(heatmap_row_meta$wgcna_module),
+    levels = module_levels_present
+  ),
+  col = list(Module = module_colors),
+  show_annotation_name = FALSE,
+  width = grid::unit(5, "mm"),
+  annotation_legend_param = list(Module = horizontal_legend)
+)
+bnf_top_annotation <- ComplexHeatmap::HeatmapAnnotation(
+  Line = column_annotation$Line,
+  CO2 = column_annotation$CO2,
+  Nitrogen = column_annotation$Nitrogen,
+  col = list(
+    Line = annotation_colors$Line,
+    CO2 = annotation_colors$CO2,
+    Nitrogen = annotation_colors$Nitrogen
+  ),
+  annotation_name_side = "left",
+  annotation_legend_param = list(
+    Line = horizontal_legend,
+    CO2 = horizontal_legend,
+    Nitrogen = horizontal_legend
+  )
+)
+bnf_heatmap_colors <- grDevices::colorRampPalette(
+  c("#1F4E79", "#F6F4F1", "#A33B3B")
+)(101)
+bnf_zscore_colors <- circlize::colorRamp2(
+  seq(-2.5, 2.5, length.out = length(bnf_heatmap_colors)),
+  bnf_heatmap_colors
+)
+bnf_heatmap_plot <- ComplexHeatmap::Heatmap(
+  bnf_heatmap_matrix,
+  name = "Z-score",
+  col = bnf_zscore_colors,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  row_split = factor(
+    as.character(heatmap_row_meta$functional_group),
+    levels = present_groups
+  ),
+  cluster_row_slices = FALSE,
+  row_title_side = "right",
+  row_title_rot = 0,
+  row_title_gp = grid::gpar(fontsize = 9),
+  column_split = column_annotation$Line,
+  cluster_column_slices = FALSE,
+  column_title_gp = grid::gpar(fontsize = 0),
+  column_gap = grid::unit(2, "mm"),
+  row_gap = grid::unit(2, "mm"),
+  left_annotation = bnf_left_annotation,
+  top_annotation = bnf_top_annotation,
+  show_column_names = FALSE,
+  row_names_side = "right",
+  row_names_gp = grid::gpar(fontsize = 9),
+  border = FALSE,
+  heatmap_legend_param = c(
+    horizontal_legend,
+    list(legend_width = grid::unit(4, "cm"))
+  )
+)
+
+draw_bnf_heatmap <- function() {
+  ComplexHeatmap::draw(
+    bnf_heatmap_plot,
+    heatmap_legend_side = "top",
+    annotation_legend_side = "top",
+    merge_legends = TRUE,
+    padding = grid::unit(c(2, 8, 2, 2), "mm")
+  )
+}
+
+bnf_plot_height <- max(8, 3.2 + 0.42 * nrow(bnf_heatmap_genes))
+grDevices::pdf(
+  file.path(output_dir, "BNF_module_DEG_expression_heatmap.pdf"),
+  width = 13,
+  height = bnf_plot_height
+)
+draw_bnf_heatmap()
+grDevices::dev.off()
+
+grDevices::png(
+  file.path(output_dir, "BNF_module_DEG_expression_heatmap.png"),
+  width = 13,
+  height = bnf_plot_height,
+  units = "in",
+  res = 300
+)
+draw_bnf_heatmap()
+grDevices::dev.off()
+
+draw_bnf_heatmap()
+```

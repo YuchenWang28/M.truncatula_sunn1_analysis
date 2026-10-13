@@ -1,0 +1,606 @@
+---
+title: "Section05_GRNvisualization"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(here)
+  library(readr)
+})
+
+grn_dir <- here("Data", "data_for_publication", "GRN_analysis")
+figure_dir <- file.path(grn_dir, "GRN_visualization")
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+
+plot_data_file <- file.path(figure_dir, "Figure6A_TF_recurrence_plot_data_updated.csv")
+
+stopifnot(file.exists(plot_data_file))
+```
+
+# A. TF recurrence across subnetworks
+
+Candidate transcription factors are shown across the 15 shoot subnetworks. A
+colored tile indicates that a TF is present in a subnetwork, with tile color
+representing outdegree (the number of target genes). Asterisks represent
+adjusted-P-value significance (`*` $P_{adj}<0.05$; `**` $P_{adj}<0.01$; `***`
+$P_{adj}<0.001$). TFs from the same family are placed in adjacent rows; within
+each family, TFs are ordered by recurrence and total outdegree.
+
+```{r prepare-figure6a-data}
+required_columns <- c(
+  "rank_within_module",
+  "regulatoryGene",
+  "subnetwork",
+  "outdegree",
+  "enrichment_p_adj",
+  "tf_label",
+  "tf_class",
+  "subnetworks_present",
+  "total_outdegree"
+)
+
+plot_data <- readr::read_csv(
+  plot_data_file,
+  locale = readr::locale(encoding = "Windows-1252"),
+  show_col_types = FALSE
+)
+
+missing_columns <- setdiff(required_columns, names(plot_data))
+if (length(missing_columns) > 0L) {
+  stop(
+    "Plot data file is missing required columns: ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+plot_data <- plot_data %>%
+  mutate(
+    across(
+      c(regulatoryGene, subnetwork, tf_label, tf_class),
+      ~ trimws(as.character(.x))
+    ),
+    outdegree = as.numeric(outdegree),
+    enrichment_p_adj = as.numeric(enrichment_p_adj),
+    subnetworks_present = as.numeric(subnetworks_present),
+    total_outdegree = as.numeric(total_outdegree),
+    padj_significance = case_when(
+      enrichment_p_adj < 0.001 ~ "***",
+      enrichment_p_adj < 0.01 ~ "**",
+      enrichment_p_adj < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  filter(
+    !is.na(regulatoryGene),
+    regulatoryGene != "",
+    !is.na(subnetwork),
+    subnetwork != "",
+    !is.na(tf_label),
+    tf_label != ""
+  )
+
+subnetwork_order <- c(
+  "red",
+  "green",
+  "turquoise",
+  "magenta",
+  "cyan",
+  "midnightblue",
+  "lightcyan",
+  "pink",
+  "brown",
+  "skyblue",
+  "white",
+  "royalblue",
+  "lightyellow",
+  "darkgreen",
+  "black"
+)
+
+available_subnetworks <- unique(plot_data$subnetwork)
+
+missing_subnetworks <- setdiff(subnetwork_order, available_subnetworks)
+unexpected_subnetworks <- setdiff(available_subnetworks, subnetwork_order)
+
+if (length(missing_subnetworks) > 0L) {
+  stop(
+    "Requested subnetworks are missing from the ranking data: ",
+    paste(missing_subnetworks, collapse = ", ")
+  )
+}
+if (length(unexpected_subnetworks) > 0L) {
+  warning(
+    "Ranking data contain subnetworks omitted from the requested order: ",
+    paste(unexpected_subnetworks, collapse = ", ")
+  )
+}
+
+tf_order <- plot_data %>%
+  group_by(regulatoryGene) %>%
+  summarise(
+    tf_label = dplyr::first(tf_label),
+    tf_class = dplyr::first(tf_class),
+    subnetworks_present = n_distinct(subnetwork),
+    total_outdegree = sum(outdegree, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(tf_class = coalesce(na_if(tf_class, ""), "Unclassified")) %>%
+  arrange(
+    tf_class,
+    desc(subnetworks_present),
+    desc(total_outdegree),
+    tf_label
+  )
+
+tf_levels <- rev(tf_order$tf_label)
+
+plot_data <- plot_data %>%
+  mutate(
+    tf_label = factor(tf_label, levels = tf_levels),
+    subnetwork = factor(subnetwork, levels = subnetwork_order)
+  )
+
+matrix_background <- tidyr::expand_grid(
+  tf_label = factor(tf_levels, levels = tf_levels),
+  subnetwork = factor(subnetwork_order, levels = subnetwork_order)
+)
+```
+
+```{r figure6a, fig.width=11, fig.height=12}
+matrix_plot <- ggplot() +
+  geom_tile(
+    data = matrix_background,
+    aes(x = subnetwork, y = tf_label),
+    fill = "grey95",
+    color = "white",
+    linewidth = 0.2
+  ) +
+  geom_tile(
+    data = plot_data,
+    aes(
+      x = subnetwork,
+      y = tf_label,
+      fill = outdegree
+    ),
+    color = "white",
+    linewidth = 0.2
+  ) +
+  geom_text(
+    data = plot_data,
+    aes(
+      x = subnetwork,
+      y = tf_label,
+      label = padj_significance,
+      color = outdegree
+    ),
+    size = 2.4
+  ) +
+  scale_fill_gradient(
+    name = "Target genes\n(outdegree)",
+    low = "#DCEFED",
+    high = "#123B4A",
+    trans = "sqrt",
+    breaks = scales::breaks_pretty(n = 5)
+  ) +
+  scale_color_gradient(
+    low = "#1A1A1A",
+    high = "white",
+    trans = "sqrt",
+    guide = "none"
+  ) +
+  labs(
+    x = "Shoot subnetwork",
+    y = NULL,
+    caption = paste(
+      "Adjusted P value:",
+      "* < 0.05; ** < 0.01; *** < 0.001"
+    )
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      color = "black"
+    ),
+    axis.text.y = element_text(size = 7, color = "black"),
+    legend.position = "right",
+    legend.box = "vertical",
+    plot.margin = margin(5.5, 2, 5.5, 5.5)
+  )
+
+figure6a <- matrix_plot
+
+figure6a
+
+ggsave(
+  file.path(figure_dir, "Figure6A_TF_recurrence.png"),
+  figure6a,
+  width = 11,
+  height = 12,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+ggsave(
+  file.path(figure_dir, "Figure6A_TF_recurrence.pdf"),
+  figure6a,
+  width = 11,
+  height = 12,
+  units = "in",
+  bg = "white"
+)
+```
+
+# B. Simplified consensus 3% network
+
+The complete consensus 3% network contains 12,191 genes and 101,721 edges in
+one connected component. It therefore does not separate into disconnected
+networks. The overview below displays it as one network while limiting the
+display to the strongest representative edges from the most connected TFs.
+WGCNA module membership is used only to sample genes across the full network;
+it is not shown in the layout. Gene labels and a force-directed layout are
+deliberately omitted to keep rendering inexpensive.
+
+```{r prepare-figure6b-network}
+consensus_network_file <- file.path(grn_dir, "consensus_network",
+  "consensus_network_deg_tf_top3pct_edges.csv"
+)
+module_membership_file <- file.path(grn_dir, "selected_module_genes.csv"
+)
+tf_summary_file <- file.path(grn_dir, "subnetwork",
+  "combined_tf_ranking_outdegree_first",
+  "TF_summary_across_all_modules.csv"
+)
+
+stopifnot(
+  file.exists(consensus_network_file),
+  file.exists(module_membership_file),
+  file.exists(tf_summary_file)
+)
+
+# These limits bound the plotted network at approximately
+# 16 modules x 10 TFs x 15 targets = 2,400 edges.
+top_tfs_per_module <- 10L
+top_targets_per_tf_module <- 15L
+network_seed <- 617L
+
+module_membership <- readr::read_csv(
+  module_membership_file,
+  show_col_types = FALSE
+) %>%
+  transmute(
+    gene = as.character(gene_id),
+    module = as.character(module)
+  ) %>%
+  distinct(gene, .keep_all = TRUE)
+
+consensus_edges <- readr::read_csv(
+  consensus_network_file,
+  show_col_types = FALSE
+) %>%
+  transmute(
+    from = as.character(regulatoryGene),
+    to = as.character(targetGene),
+    GeoMeanRank = as.numeric(GeoMeanRank)
+  ) %>%
+  left_join(
+    module_membership %>%
+      rename(to = gene, target_module = module),
+    by = "to"
+  ) %>%
+  mutate(target_module = coalesce(target_module, "unassigned"))
+
+module_levels <- c(subnetwork_order, "unassigned")
+
+tf_annotations <- readr::read_csv(
+  tf_summary_file,
+  show_col_types = FALSE
+) %>%
+  transmute(
+    from = as.character(regulatoryGene),
+    tf_acronym = na_if(trimws(as.character(tf_acronym)), "")
+  ) %>%
+  distinct(from, .keep_all = TRUE)
+
+top5_tfs <- consensus_edges %>%
+  count(from, name = "full_outdegree") %>%
+  slice_max(full_outdegree, n = 5L, with_ties = FALSE) %>%
+  arrange(desc(full_outdegree), from) %>%
+  mutate(outdegree_rank = row_number()) %>%
+  left_join(tf_annotations, by = "from") %>%
+  mutate(
+    tf_display_name = coalesce(
+      tf_acronym,
+      sub("^MtrunA17_", "", from)
+    ),
+    top5_label = paste0(
+      "#", outdegree_rank, " ", tf_display_name,
+      "\nOutdegree = ", scales::comma(full_outdegree)
+    )
+  )
+
+top_module_tfs <- consensus_edges %>%
+  count(target_module, from, name = "module_outdegree") %>%
+  group_by(target_module) %>%
+  slice_max(
+    module_outdegree,
+    n = top_tfs_per_module,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+
+network_plot_edges <- consensus_edges %>%
+  inner_join(
+    top_module_tfs,
+    by = c("target_module", "from")
+  ) %>%
+  group_by(target_module, from) %>%
+  slice_min(
+    GeoMeanRank,
+    n = top_targets_per_tf_module,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+
+# Explicitly retain representative edges for every global top-five TF, even if
+# one is not among the top ten TFs for a particular target module.
+top5_plot_edges <- consensus_edges %>%
+  semi_join(top5_tfs, by = "from") %>%
+  group_by(from) %>%
+  slice_min(
+    GeoMeanRank,
+    n = top_targets_per_tf_module,
+    with_ties = FALSE
+  ) %>%
+  ungroup()
+
+network_plot_edges <- bind_rows(
+  network_plot_edges,
+  top5_plot_edges
+) %>%
+  distinct(from, to, .keep_all = TRUE)
+
+network_plot_nodes <- tibble::tibble(
+  gene = unique(c(network_plot_edges$from, network_plot_edges$to))
+) %>%
+  left_join(module_membership, by = "gene") %>%
+  left_join(
+    top5_tfs %>%
+      select(
+        gene = from,
+        full_outdegree,
+        outdegree_rank,
+        top5_label
+      ),
+    by = "gene"
+  ) %>%
+  mutate(
+    module = coalesce(module, "unassigned"),
+    module = factor(module, levels = module_levels),
+    node_type = if_else(
+      gene %in% network_plot_edges$from,
+      "TF",
+      "Target"
+    )
+  )
+
+# Use a deterministic hub-centered radial layout. The highest-outdegree TF is
+# at the origin, the next four TFs form the innermost ring, the remaining TFs
+# occupy a second ring, and target genes fill the outer annulus.
+set.seed(network_seed)
+
+golden_angle <- pi * (3 - sqrt(5))
+
+plot_node_degree <- bind_rows(
+  network_plot_edges %>% count(gene = from, name = "degree"),
+  network_plot_edges %>% count(gene = to, name = "degree")
+) %>%
+  group_by(gene) %>%
+  summarise(plot_degree = sum(degree), .groups = "drop")
+
+network_plot_nodes <- network_plot_nodes %>%
+  left_join(plot_node_degree, by = "gene") %>%
+  mutate(plot_degree = coalesce(plot_degree, 0L))
+
+top5_layout <- network_plot_nodes %>%
+  filter(!is.na(outdegree_rank)) %>%
+  arrange(outdegree_rank) %>%
+  mutate(
+    radius = if_else(outdegree_rank == 1L, 0, 0.9),
+    angle = if_else(
+      outdegree_rank == 1L,
+      0,
+      (outdegree_rank - 2L) * 2 * pi / 4 + pi / 4
+    ),
+    x = radius * cos(angle),
+    y = radius * sin(angle)
+  ) %>%
+  select(gene, x, y)
+
+other_tf_layout <- network_plot_nodes %>%
+  filter(node_type == "TF", is.na(outdegree_rank)) %>%
+  arrange(desc(plot_degree), gene) %>%
+  mutate(
+    radial_index = row_number(),
+    radial_count = n(),
+    radius = 2.0 + 1.15 * sqrt((radial_index - 0.5) / radial_count),
+    angle = radial_index * golden_angle,
+    x = radius * cos(angle),
+    y = radius * sin(angle)
+  ) %>%
+  select(gene, x, y)
+
+target_layout <- network_plot_nodes %>%
+  filter(node_type == "Target") %>%
+  arrange(desc(plot_degree), gene) %>%
+  mutate(
+    radial_index = row_number(),
+    radial_count = n(),
+    radius = 4.0 + 4.8 * sqrt((radial_index - 0.5) / radial_count),
+    angle = radial_index * golden_angle,
+    x = radius * cos(angle),
+    y = radius * sin(angle)
+  ) %>%
+  select(gene, x, y)
+
+network_layout <- bind_rows(
+  top5_layout,
+  other_tf_layout,
+  target_layout
+)
+
+network_plot_nodes <- network_plot_nodes %>%
+  left_join(network_layout, by = "gene")
+
+if (anyNA(network_plot_nodes$x) || anyNA(network_plot_nodes$y)) {
+  stop("Hub-centered radial layout failed to position every plotted gene.")
+}
+
+top5_plot_nodes <- network_plot_nodes %>%
+  filter(!is.na(outdegree_rank))
+
+network_plot_edges <- network_plot_edges %>%
+  left_join(
+    network_plot_nodes %>%
+      select(gene, from_x = x, from_y = y),
+    by = c("from" = "gene")
+  ) %>%
+  left_join(
+    network_plot_nodes %>%
+      select(gene, to_x = x, to_y = y),
+    by = c("to" = "gene")
+  )
+
+readr::write_csv(
+  network_plot_edges,
+  file.path(figure_dir, "Figure6B_simplified_network_edges.csv")
+)
+readr::write_csv(
+  network_plot_nodes,
+  file.path(figure_dir, "Figure6B_simplified_network_nodes.csv")
+)
+```
+
+```{r figure6b, fig.width=13, fig.height=13}
+figure6b <- ggplot() +
+  geom_segment(
+    data = network_plot_edges,
+    aes(
+      x = from_x,
+      y = from_y,
+      xend = to_x,
+      yend = to_y
+    ),
+    color = "grey35",
+    linewidth = 0.08,
+    alpha = 0.055
+  ) +
+  geom_point(
+    data = network_plot_nodes %>% filter(node_type == "Target"),
+    aes(x = x, y = y),
+    shape = 16,
+    size = 0.65,
+    color = "grey62",
+    alpha = 0.9
+  ) +
+  geom_point(
+    data = network_plot_nodes %>% filter(node_type == "TF"),
+    aes(x = x, y = y),
+    shape = 24,
+    size = 2.4,
+    fill = "#2C7FB8",
+    color = "black",
+    stroke = 0.45,
+    alpha = 0.95
+  ) +
+  geom_point(
+    data = top5_plot_nodes,
+    aes(x = x, y = y),
+    shape = 24,
+    size = 5,
+    fill = "#FFD92F",
+    color = "black",
+    stroke = 0.8
+  ) +
+  ggrepel::geom_label_repel(
+    data = top5_plot_nodes,
+    aes(x = x, y = y, label = top5_label),
+    seed = network_seed,
+    size = 3.1,
+    fontface = "bold",
+    box.padding = 0.45,
+    point.padding = 0.4,
+    min.segment.length = 0,
+    segment.color = "grey25",
+    segment.linewidth = 0.35,
+    fill = scales::alpha("white", 0.9),
+    label.size = 0.2,
+    max.overlaps = Inf
+  ) +
+  coord_equal(
+    xlim = c(-10.8, 10.8),
+    ylim = c(-10.8, 10.8),
+    clip = "off"
+  ) +
+  labs(
+    title = "Simplified consensus 3% shoot regulatory network",
+    subtitle = paste0(
+      scales::comma(nrow(network_plot_nodes)),
+      " genes and ",
+      scales::comma(nrow(network_plot_edges)),
+      paste0(
+        " representative edges; triangles are TFs and yellow triangles ",
+        "mark the five highest-outdegree TFs"
+      )
+    ),
+    caption = paste0(
+      "Hub-centered radial layout: highest-outdegree TFs are nearest the center ",
+      "and target genes occupy the outer annulus. ",
+      "The full network contains 12,191 genes and 101,721 edges."
+    )
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey30"),
+    plot.caption = element_text(hjust = 0.5, color = "grey35"),
+    plot.margin = margin(12, 12, 12, 12)
+  )
+
+figure6b
+
+ggsave(
+  file.path(figure_dir, "Figure6B_consensus_3pct_simplified.png"),
+  figure6b,
+  width = 13,
+  height = 13,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+ggsave(
+  file.path(figure_dir, "Figure6B_consensus_3pct_simplified.pdf"),
+  figure6b,
+  width = 13,
+  height = 13,
+  units = "in",
+  bg = "white"
+)
+```
+
