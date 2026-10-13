@@ -1,0 +1,1611 @@
+---
+title: "Section03_WGCNAnalysis"
+author: "Yuchen Wang"
+date: "4/10/2026"
+output:
+  html_document:
+    code_folding: hide
+---
+
+##Environment and Libraries SetUp
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(here)
+project_library <- here(".r-library", paste(R.version$major,
+                                           strsplit(R.version$minor, "\\.")[[1]][1],
+                                           sep = "."))
+if (dir.exists(project_library)) .libPaths(c(project_library, .libPaths()))
+
+# Publication inputs and outputs, relative to the project root.
+in_dir <- here("Data", "data_for_publication")
+out_dir <- file.path(in_dir, "WGCNA_analysis")
+library(DESeq2)
+library(SummarizedExperiment)
+
+# DESeq2 1.48 caches a DESeqDataSet definition that still requires ExpData.
+# The DESeq2 namespace is locked, so the union has to be created in .GlobalEnv
+# before vst() or subsetting calls validObject().
+if (is.null(methods::getClassDef("ExpData", where = asNamespace("DESeq2")))) {
+  methods::setClassUnion(
+    "ExpData",
+    c("matrix", "SummarizedExperiment")
+  )
+}
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(knitr)
+library(WGCNA)
+library(emmeans)
+cor <- WGCNA::cor
+allowWGCNAThreads()
+```
+
+##Load DESeq2 object (Shoot model) and Trait
+
+```{r Load DESeq2 object (Shoot model) and Trait}
+#Load DESeq2 object (Shoot model)
+dds_path <- file.path(in_dir, "DEG_analysis", "dds_shoot.rds")
+if (!file.exists(dds_path)) {
+  stop("DESeq2 object not found: ", dds_path,
+       ". Run Section02_DEGAnalysis.Rmd first.")
+}
+dds_shoot <- readRDS(dds_path)
+
+#Remove Expression Outliers (based on WGCNA sample dendrogram)
+outlier_id <- "MTNC184"
+if (outlier_id %in% colnames(dds_shoot)) {
+  dds_shoot <- dds_shoot[, colnames(dds_shoot) != outlier_id]
+  cat("Removed outlier sample: ", outlier_id, "\n", sep = "")
+}
+cat("dds: ", nrow(dds_shoot), " genes, ", ncol(dds_shoot), " samples\n")
+
+#Load Trait Data
+phys_file <- file.path(in_dir, "Trait_A17_sunn.csv")
+phys <- read_csv(phys_file, show_col_types = FALSE)
+cat("Physiology: ", nrow(phys), " samples\n")
+```
+
+##Data-Preprocessing and Quality Control
+
+```{r Data-Preprocessing}
+#Set Output Directory
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+cat("Output directory: ", out_dir, "\n", sep = "")
+
+#VST transformation of Data and restructuring to match WGCNA format
+vsd <- DESeq2::vst(dds_shoot, blind = FALSE)
+expr <- assay(vsd)  # genes x samples
+datExpr <- t(expr) #sample x genes
+rownames(datExpr) <- colnames(expr)
+colnames(datExpr) <- rownames(expr)
+cat("Expression matrix: ", nrow(datExpr), " samples x ", ncol(datExpr), " genes\n")
+
+#Match Trait Data sample with the Expression Data
+samp_ids <- rownames(datExpr)
+phys_match <- as.data.frame(phys %>%
+  dplyr::filter(RNA.seq.id %in% samp_ids) %>%
+  dplyr::distinct(RNA.seq.id, .keep_all = TRUE))
+rownames(phys_match) <- phys_match$RNA.seq.id
+phys_match <- phys_match[samp_ids, ]
+cat("Matched physiology: ", nrow(phys_match), " samples\n", sep = "")
+```
+
+```{r Samples QC}
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+
+if (!gsg$allOK) {
+  if (sum(!gsg$goodGenes) > 0) {
+    cat("Removing ", sum(!gsg$goodGenes), " genes with too many missing values or zero variance\n")
+  }
+  if (sum(!gsg$goodSamples) > 0) {
+    cat("Removing ", sum(!gsg$goodSamples), " outlier samples\n")
+  }
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+}
+cat("After filtering: ", nrow(datExpr), " samples x ", ncol(datExpr), " genes\n")
+
+sampleTree <- hclust(dist(datExpr), method = "average")
+par(mar = c(0, 4, 2, 0))
+plot(sampleTree, main = "Sample clustering to detect outliers",
+     xlab = "", sub = "", cex = 0.7)
+
+# Save plot
+pdf(file.path(out_dir, "01_sample_dendrogram.pdf"), width = 10, height = 6)
+par(mar = c(0, 4, 2, 0))
+plot(sampleTree, main = "Sample clustering to detect outliers",
+     xlab = "", sub = "", cex = 0.7)
+dev.off()
+```
+
+##Soft Threshold Selection and WGCNA network construction
+
+```{r Identify soft-threshold}
+powers <- c(c(1:10), seq(12, 20, 2))
+sft <- pickSoftThreshold(datExpr, powerVector = powers, networkType = "signed", verbose = 5)
+par(mfrow = c(1, 2))
+plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = paste("Scale independence"))
+text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, cex = 0.9, col = "red")
+abline(h = 0.75, col = "red", lty = 2)
+plot(sft$fitIndices[, 1], sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity",
+     type = "n", main = paste("Mean connectivity"))
+text(sft$fitIndices[, 1], sft$fitIndices[, 5],
+     labels = powers, cex = 0.9, col = "red")
+
+# Pick power: first power reaching R^2 >= 0.75 (lowest power with flattening connectivity) -> scale free 
+idx_75 <- which(-sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2] >= 0.75)
+if (length(idx_75) > 0) {
+  power_use <- sft$fitIndices$Power[min(idx_75)]
+} else {
+  power_use <- 6  # default fallback
+}
+cat("Selected soft-threshold power: ", power_use, "\n", sep = "")
+
+# Save Threshold Plot and Data Point
+pdf(file.path(out_dir, "02_soft_threshold_selection.pdf"), width = 10, height = 5)
+par(mfrow = c(1, 2))
+plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = paste("Scale independence"))
+text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, cex = 0.9, col = "red")
+abline(h = 0.75, col = "red", lty = 2)
+plot(sft$fitIndices[, 1], sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity",
+     type = "n", main = paste("Mean connectivity"))
+text(sft$fitIndices[, 1], sft$fitIndices[, 5],
+     labels = powers, cex = 0.9, col = "red")
+dev.off()
+write_csv(sft$fitIndices, file.path(out_dir, "soft_threshold_fit.csv"))
+```
+
+```{r load-saved-WGCNA-optional}
+# Set TRUE to skip blockwiseModules below and restore from a prior run.
+reuse_wgcna_saved <- FALSE
+wgcna_rds <- file.path(out_dir, "ShootWGCNA_objects.rds")
+if (reuse_wgcna_saved) {
+  if (!file.exists(wgcna_rds)) {
+    stop("reuse_wgcna_saved is TRUE but file not found: ", wgcna_rds)
+  }
+  wgcna_obj <- readRDS(wgcna_rds)
+  datExpr <- wgcna_obj$datExpr
+  moduleColors <- wgcna_obj$moduleColors
+  net <- wgcna_obj$net
+  power_use <- wgcna_obj$power
+  cat("Loaded saved WGCNA object from ", wgcna_rds, "\n", sep = "")
+}
+```
+
+```{r Network construction and module detection}
+if (!reuse_wgcna_saved) {
+  net <- blockwiseModules(
+    datExpr,
+    power = power_use,
+    networkType = "signed",
+    TOMType = "signed",
+    minModuleSize = 30,
+    reassignThreshold = 0,
+    mergeCutHeight = 0.25,
+    numericLabels = TRUE,
+    pamRespectsDendro = FALSE,
+    saveTOMs = TRUE,
+    saveTOMFileBase = file.path(out_dir, "shootTOM"),
+    verbose = 3
+  )
+
+  moduleColors <- labels2colors(net$colors) # Convert numeric labels to colors
+}
+
+table(moduleColors) %>% kable()
+
+# Module summary: number of genes per module
+module_sizes <- as.data.frame(table(moduleColors)) %>%
+  dplyr::rename(Module = moduleColors, nGenes = Freq) %>%
+  dplyr::arrange(desc(nGenes))
+#write_csv(module_sizes, file.path(out_dir, "module_sizes.csv"))
+# Gene-to-module assignment
+gene_module_df <- tibble(
+  gene = colnames(datExpr),
+  module = moduleColors
+)
+#write_csv(gene_module_df, file.path(out_dir, "gene_module_assignment.csv"))
+# Genes per module (one file per module)
+module_list <- unique(moduleColors)
+for (mod in module_list) {
+  genes_in_mod <- gene_module_df %>% dplyr::filter(module == mod) %>% dplyr::pull(gene)
+  #write_lines(genes_in_mod, file.path(out_dir, paste0("module_genes_", mod, ".txt")))
+}
+cat("Exported gene lists for ", length(module_list), " modules\n", sep = "")
+```
+
+```{r module-dendrogram to exam how well module assignment corresponds to the gene clustering}
+plotDendroAndColors(net$dendrograms[[2]], moduleColors[net$blockGenes[[2]]],
+                    "Module colors",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+pdf(file.path(out_dir, "03_module_dendrogram.pdf"), width = 12, height = 7)
+plotDendroAndColors(net$dendrograms[[2]], moduleColors[net$blockGenes[[2]]],
+                    "Module colors",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+dev.off()
+```
+
+```{r save-objects for downstream analysis}
+MEs0 <- moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs <- orderMEs(MEs0)
+MEs0 <- moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs_ordered <- orderMEs(MEs0)
+
+saveRDS(list(
+  datExpr = datExpr,
+  moduleColors = moduleColors,
+  MEs = MEs,
+  net = net,
+  power = power_use
+), file.path(out_dir, "ShootWGCNA_objects.rds"))
+
+cat("Saved ShootWGCNA_objects.rds\n")
+```
+
+```{r summary}
+cat("=== Shoot WGCNA Summary ===\n")
+cat("Samples: ", nrow(datExpr), "\n")
+cat("Genes: ", ncol(datExpr), "\n")
+cat("Soft-threshold power: ", power_use, "\n")
+cat("Modules: ", length(unique(moduleColors)), "\n")
+cat("Output: ", out_dir, "\n")
+```
+
+## Non-Grey Module-Module Correlation Bubble Plot
+
+```{r non-grey-module-module-correlation-bubble-plot}
+is_grey_module <- function(module_name) {
+  grepl("^MEgrey$", module_name, ignore.case = TRUE)
+}
+
+drop_grey_module <- function(me_mat) {
+  me_mat[, !is_grey_module(colnames(me_mat)), drop = FALSE]
+}
+
+# Recalculate eigengenes from every assigned module color to ensure the plot
+# cannot omit modules that may be absent from a saved MEs object.
+non_grey_mes <- moduleEigengenes(datExpr, moduleColors)$eigengenes %>%
+  orderMEs() %>%
+  drop_grey_module()
+
+expected_non_grey_modules <- setdiff(unique(as.character(moduleColors)), "grey")
+missing_module_eigengenes <- setdiff(
+  paste0("ME", expected_non_grey_modules),
+  colnames(non_grey_mes)
+)
+if (length(missing_module_eigengenes) > 0) {
+  stop(
+    "Missing recalculated module eigengene(s): ",
+    paste(missing_module_eigengenes, collapse = ", ")
+  )
+}
+
+if (ncol(non_grey_mes) < 2) {
+  stop("At least two non-grey module eigengenes are required.")
+}
+
+cat("Modules included in module-module plots: ",
+    ncol(non_grey_mes), " of ", length(expected_non_grey_modules),
+    " non-grey modules\n", sep = "")
+
+module_cor_mat <- cor(non_grey_mes, use = "pairwise.complete.obs")
+module_hclust <- hclust(as.dist(1 - module_cor_mat), method = "complete")
+module_order <- colnames(module_cor_mat)[module_hclust$order]
+
+module_cor_df <- as.data.frame(as.table(module_cor_mat)) %>%
+  dplyr::rename(
+    Module1 = Var1,
+    Module2 = Var2,
+    Correlation = Freq
+  ) %>%
+  dplyr::mutate(
+    Module1Index = match(as.character(Module1), module_order),
+    Module2Index = match(as.character(Module2), module_order),
+    n_samples = mapply(
+      function(module1, module2) {
+        sum(stats::complete.cases(
+          non_grey_mes[, c(as.character(module1), as.character(module2)), drop = FALSE]
+        ))
+      },
+      Module1,
+      Module2
+    ),
+    t_statistic = Correlation * sqrt(
+      (n_samples - 2) / pmax(1 - Correlation^2, .Machine$double.eps)
+    ),
+    pvalue = 2 * stats::pt(
+      abs(t_statistic),
+      df = n_samples - 2,
+      lower.tail = FALSE
+    )
+  ) %>%
+  # Keep each module pair once and omit self-correlations.
+  dplyr::filter(Module1Index < Module2Index) %>%
+  dplyr::mutate(p.adj = p.adjust(pvalue, method = "fdr")) %>%
+  dplyr::filter(p.adj < 0.05) %>%
+  dplyr::mutate(
+    Module1 = factor(
+      sub("^ME", "", as.character(Module1)),
+      levels = sub("^ME", "", module_order)
+    ),
+    Module2 = factor(
+      sub("^ME", "", as.character(Module2)),
+      levels = rev(sub("^ME", "", module_order))
+    ),
+    AbsCorrelation = abs(Correlation)
+  )
+
+module_cor_bubble_plot <- ggplot(
+  module_cor_df,
+  aes(x = Module1, y = Module2, size = AbsCorrelation, color = Correlation)
+) +
+  geom_point(alpha = 0.9) +
+  scale_size_continuous(
+    name = "|Correlation|",
+    limits = c(0, 1),
+    range = c(1, 10)
+  ) +
+  scale_color_gradient2(
+    name = "Correlation",
+    low = "#5F8F9A",
+    mid = "grey98",
+    high = "burlywood3",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  coord_fixed() +
+  labs(
+    title = "Significant non-grey module-module correlations",
+    x = "Module",
+    y = "Module"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+module_cor_bubble_plot
+
+module_cor_plot_file <- file.path(
+  out_dir,
+  "non_grey_module_module_correlation_bubble_plot.png"
+)
+
+ggsave(
+  module_cor_plot_file,
+  plot = module_cor_bubble_plot,
+  width = max(8, ncol(non_grey_mes) * 0.35 + 4),
+  height = max(7, ncol(non_grey_mes) * 0.35 + 3),
+  units = "in",
+  dpi = 150
+)
+
+# pheatmap retains all matrix rows and columns and draws both clustering
+# dendrograms directly beside the heatmap.
+module_cor_palette <- grDevices::colorRampPalette(
+  c("#5F8F9A", "grey98", "burlywood3")
+)(101)
+
+# Show all correlations in the upper-right half. Modules are hierarchically
+# clustered using 1 - eigengene correlation as distance and complete linkage.
+cluster_position <- match(
+  seq_len(ncol(module_cor_mat)),
+  module_hclust$order
+)
+lower_triangle_mask <- outer(cluster_position, cluster_position, ">")
+module_cor_upper_triangle <- module_cor_mat
+module_cor_upper_triangle[lower_triangle_mask] <- NA_real_
+
+module_cor_heatmap <- pheatmap::pheatmap(
+  module_cor_upper_triangle,
+  cluster_rows = module_hclust,
+  cluster_cols = module_hclust,
+  color = module_cor_palette,
+  breaks = seq(-1, 1, length.out = 102),
+  border_color = "white",
+  labels_row = sub("^ME", "", rownames(module_cor_mat)),
+  labels_col = sub("^ME", "", colnames(module_cor_mat)),
+  treeheight_row = 70,
+  treeheight_col = 70,
+  fontsize = 8,
+  na_col = "white",
+  main = "All non-grey module-module correlations (upper triangle)",
+  silent = TRUE
+)
+
+grid::grid.newpage()
+grid::grid.draw(module_cor_heatmap$gtable)
+
+module_cor_heatmap_file <- file.path(
+  out_dir,
+  "non_grey_module_module_correlation_clustered_heatmap.png"
+)
+ggsave(
+  module_cor_heatmap_file,
+  plot = module_cor_heatmap$gtable,
+  width = max(9, ncol(non_grey_mes) * 0.35 + 4),
+  height = max(8, ncol(non_grey_mes) * 0.35 + 3),
+  units = "in",
+  dpi = 180
+)
+
+write_csv(
+  module_cor_df %>%
+    dplyr::mutate(
+      Module1 = as.character(Module1),
+      Module2 = as.character(Module2)
+    ) %>%
+    dplyr::select(
+      Module1, Module2, Correlation, AbsCorrelation,
+      pvalue, p.adj, n_samples
+    ),
+  file.path(out_dir, "non_grey_module_module_correlations.csv")
+)
+
+cat("Saved module-module correlation bubble plot to: ",
+    module_cor_plot_file, "\n",
+    "Saved clustered module-module correlation heatmap to: ",
+    module_cor_heatmap_file, "\n", sep = "")
+```
+
+## Plot Module Eigengene by Module Color
+
+Call `plot_module_eigengene()` with a module color, for example `plot_module_eigengene("blue")` or `plot_module_eigengene("MEblue")`. The plot shows each sample, mean ± 1 SD error bars, and a LOESS-smoothed mean nitrogen response for each CO2 treatment, with Line as facets. The function also prints an all-sample `Line × N × CO2` ANOVA and separate `N × CO2` ANOVAs within each line.
+
+```{r plot-module-eigengene-function}
+plot_module_eigengene <- function(module_color,
+                                  me_mat = MEs,
+                                  trait_df = phys_match,
+                                  co2_levels = c("AC", "EC"),
+                                  line_width = 1.2,
+                                  smooth_span = 0.75,
+                                  sample_point_size = 1.8,
+                                  sample_point_alpha = 0.7,
+                                  print_anova = TRUE,
+                                  save_plot = FALSE,
+                                  output_dir = out_dir) {
+  module_name <- as.character(module_color)[1]
+  if (!grepl("^ME", module_name)) {
+    module_name <- paste0("ME", module_name)
+  }
+
+  if (!module_name %in% colnames(me_mat)) {
+    stop(
+      "Module eigengene not found: ", module_name,
+      "\nAvailable modules: ", paste(colnames(me_mat), collapse = ", ")
+    )
+  }
+
+  required_cols <- c("Line", "CO2", "Nitrogen")
+  missing_cols <- setdiff(required_cols, names(trait_df))
+  if (length(missing_cols) > 0) {
+    stop("Missing required trait column(s): ", paste(missing_cols, collapse = ", "))
+  }
+
+  sample_ids <- intersect(rownames(trait_df), rownames(me_mat))
+  if (length(sample_ids) == 0) {
+    stop("No overlapping sample row names between trait_df and me_mat.")
+  }
+
+  plot_df <- trait_df[sample_ids, , drop = FALSE] %>%
+    dplyr::mutate(
+      Sample = sample_ids,
+      ME = as.numeric(me_mat[sample_ids, module_name]),
+      Line = factor(Line),
+      CO2 = factor(CO2, levels = co2_levels),
+      Nitrogen_mM = as.numeric(as.character(Nitrogen))
+    ) %>%
+    dplyr::filter(
+      is.finite(ME),
+      !is.na(Line),
+      !is.na(CO2),
+      is.finite(Nitrogen_mM)
+    )
+
+  if (nrow(plot_df) == 0) {
+    stop("No complete rows available to plot ", module_name, ".")
+  }
+
+  nitrogen_breaks <- sort(unique(plot_df$Nitrogen_mM))
+
+  trend <- plot_df %>%
+    dplyr::group_by(Line, CO2, Nitrogen_mM) %>%
+    dplyr::summarise(
+      mean_ME = mean(ME, na.rm = TRUE),
+      sd_ME = sd(ME, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      sd_ME = dplyr::if_else(is.na(sd_ME) | is.nan(sd_ME), 0, sd_ME)
+    )
+
+  co2_colors <- c(AC = "cadetblue2", EC = "cadetblue4")
+  missing_color_levels <- setdiff(levels(droplevels(plot_df$CO2)), names(co2_colors))
+  if (length(missing_color_levels) > 0) {
+    extra_colors <- grDevices::hcl.colors(length(missing_color_levels), "Dark 3")
+    co2_colors <- c(co2_colors, stats::setNames(extra_colors, missing_color_levels))
+  }
+
+  p <- ggplot(trend, aes(x = Nitrogen_mM, y = mean_ME, color = CO2, group = CO2))
+
+  p <- p +
+    geom_errorbar(
+      aes(ymin = mean_ME - sd_ME, ymax = mean_ME + sd_ME),
+      width = 0.15,
+      linewidth = 0.55
+    ) +
+    geom_point(
+      data = plot_df,
+      aes(x = Nitrogen_mM, y = ME, color = CO2),
+      inherit.aes = FALSE,
+      size = sample_point_size,
+      alpha = sample_point_alpha
+    ) +
+    geom_smooth(
+      method = "loess",
+      formula = y ~ x,
+      span = smooth_span,
+      se = FALSE,
+      linewidth = line_width
+    ) +
+    scale_color_manual(name = expression(CO[2]), values = co2_colors) +
+    scale_x_continuous(
+      breaks = nitrogen_breaks,
+      labels = function(x) format(x, trim = TRUE, drop0trailing = TRUE)
+    ) +
+    facet_wrap(~ Line) +
+    labs(
+      title = paste0(module_name, " eigengene"),
+      x = "Nitrogen (mM)",
+      y = "Module eigengene"
+    ) +
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold"),
+      panel.grid = element_blank(),
+      axis.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+
+  if (print_anova) {
+    anova_df <- plot_df %>%
+      dplyr::mutate(
+        Line = droplevels(Line),
+        CO2 = droplevels(CO2)
+      )
+
+    anova_note <- "all data"
+    if (module_name == "MEgreen") {
+      green_iqr_df <- anova_df %>%
+        dplyr::group_by(Line, CO2, Nitrogen_mM) %>%
+        dplyr::mutate(
+          .q1 = stats::quantile(ME, 0.25, na.rm = TRUE),
+          .q3 = stats::quantile(ME, 0.75, na.rm = TRUE),
+          .iqr = .q3 - .q1,
+          .is_outlier = ME < (.q1 - 1.5 * .iqr) | ME > (.q3 + 1.5 * .iqr)
+        ) %>%
+        dplyr::ungroup()
+
+      removed_green_outliers <- green_iqr_df %>%
+        dplyr::filter(.is_outlier)
+
+      anova_df <- green_iqr_df %>%
+        dplyr::filter(!.is_outlier) %>%
+        dplyr::select(-.q1, -.q3, -.iqr, -.is_outlier)
+
+      cat(
+        "\nRemoved ", nrow(removed_green_outliers),
+        " MEgreen outlier(s) using the 1.5 x IQR rule within Line x CO2 x Nitrogen groups",
+        if (nrow(removed_green_outliers) > 0) {
+          paste0(": ", paste(removed_green_outliers$Sample, collapse = ", "))
+        } else {
+          "."
+        },
+        "\n",
+        sep = ""
+      )
+      anova_note <- "after within-treatment 1.5 x IQR outlier removal"
+    }
+
+    if (
+      nrow(anova_df) >= 3L &&
+      nlevels(anova_df$Line) > 1L &&
+      nlevels(anova_df$CO2) > 1L &&
+      dplyr::n_distinct(anova_df$Nitrogen_mM) > 1L
+    ) {
+      cat("\n## ", module_name, " ANOVA - Line x N (numeric) x CO2 (", anova_note, ")\n\n", sep = "")
+      fit_full <- aov(ME ~ Line * Nitrogen_mM * CO2, data = anova_df)
+      print(summary(fit_full))
+
+      for (ln in levels(droplevels(anova_df$Line))) {
+        sub <- anova_df %>% dplyr::filter(Line == ln)
+        if (nrow(sub) < 3L || nlevels(droplevels(sub$CO2)) < 2L || dplyr::n_distinct(sub$Nitrogen_mM) < 2L) next
+
+        cat("\n## ", module_name, " ANOVA - Line: ", ln, " (N numeric x CO2)\n\n", sep = "")
+        fit_line <- aov(ME ~ Nitrogen_mM * CO2, data = sub)
+        print(summary(fit_line))
+      }
+    } else {
+      cat("\n## ", module_name, " ANOVA skipped - insufficient Line, CO2, or N replication\n\n", sep = "")
+    }
+  }
+
+  if (save_plot) {
+    plot_file <- file.path(output_dir, paste0(module_name, "_eigengene_line_plot.png"))
+    ggsave(plot_file, plot = p, width = 7, height = 4.5, units = "in", dpi = 150)
+    cat("Saved module eigengene plot to: ", plot_file, "\n", sep = "")
+  }
+
+  return(p)
+}
+```
+
+```{r plot-module-eigengene-example, eval=FALSE}
+all_module_plots <- stats::setNames(
+  lapply(
+    colnames(MEs),
+    function(module_name) {
+      plot_module_eigengene(module_name, save_plot = TRUE)
+    }
+  ),
+  colnames(MEs)
+)
+
+
+print (plot_module_eigengene("pink", save_plot = FALSE))
+print (plot_module_eigengene("white", save_plot = FALSE))
+print (plot_module_eigengene("black", save_plot = FALSE))
+```
+
+```{r plot-red-green-module-eigengenes, fig.width=12, fig.height=4.5}
+red_eigengene_plot <- plot_module_eigengene(
+  "red",
+  print_anova = FALSE,
+  save_plot = FALSE
+)
+
+green_eigengene_plot <- plot_module_eigengene(
+  "green",
+  print_anova = TRUE,
+  save_plot = FALSE
+)
+
+red_green_eigengene_plot <- ggpubr::ggarrange(
+  red_eigengene_plot,
+  green_eigengene_plot,
+  ncol = 2,
+  nrow = 1,
+  common.legend = TRUE,
+  legend = "bottom"
+)
+
+red_green_eigengene_plot
+
+
+```
+
+```{r plot-four-module-eigengenes, fig.width=12, fig.height=9}
+skyblue_eigengene_plot <- plot_module_eigengene(
+  "skyblue",
+  print_anova = FALSE,
+  save_plot = FALSE
+)
+
+royalblue_eigengene_plot <- plot_module_eigengene(
+  "royalblue",
+  print_anova = FALSE,
+  save_plot = FALSE
+)
+
+darkgreen_eigengene_plot <- plot_module_eigengene(
+  "darkgreen",
+  print_anova = FALSE,
+  save_plot = FALSE
+)
+
+lightyellow_eigengene_plot <- plot_module_eigengene(
+  "lightyellow",
+  print_anova = FALSE,
+  save_plot = FALSE
+)
+
+four_module_eigengene_plot <- ggpubr::ggarrange(
+  skyblue_eigengene_plot,
+  royalblue_eigengene_plot,
+  darkgreen_eigengene_plot,
+  lightyellow_eigengene_plot,
+  ncol = 2,
+  nrow = 2,
+  common.legend = TRUE,
+  legend = "bottom"
+)
+
+four_module_eigengene_plot
+```
+
+## Prepare Traits for Correlation Figures
+
+```{r prepare-correlation-figure-traits}
+# Match the test-script trait table while using the publication shoot traits.
+correlation_phys <- read_csv(
+  here("Data", "A17_sunn_nodule.csv"), show_col_types = FALSE
+)
+supplemental_traits <- read_csv(
+  file.path(in_dir, "Trait_A17_sunn.csv"), show_col_types = FALSE
+) %>%
+  dplyr::select(RNA.seq.id, ShootCN_ratio, N_soil_uptake_mg, SPAD) %>%
+  dplyr::distinct(RNA.seq.id, .keep_all = TRUE)
+correlation_phys_match <- correlation_phys %>%
+  dplyr::left_join(supplemental_traits, by = "RNA.seq.id") %>%
+  dplyr::filter(RNA.seq.id %in% rownames(datExpr)) %>%
+  dplyr::distinct(RNA.seq.id, .keep_all = TRUE) %>%
+  as.data.frame()
+rownames(correlation_phys_match) <- correlation_phys_match$RNA.seq.id
+correlation_phys_match <- correlation_phys_match[rownames(datExpr), , drop = FALSE]
+correlation_phys_match$Line <- as.character(trimws(correlation_phys_match$Line))
+```
+
+## Correlate Traits with Shoot Modules
+
+This script uses `A17_sunn_nodule.csv` as the primary trait table and adds `ShootCN_ratio`, `N_soil_uptake_mg`, and `SPAD` from the publication `Trait_A17_sunn.csv`. It uses `FixedN` if that column exists; otherwise it treats `FixedN` as the display/output name for `N_fixed_mg`. Sample `MTNC181` is excluded only from the `Ndfa_pct` correlations.
+
+```{r fixedn-ndfa-biomass-module-trait-correlation}
+fixedn_column <- if ("FixedN" %in% names(correlation_phys_match)) "FixedN" else "N_fixed_mg"
+trait_lookup <- c(
+  "Ndfa%" = "Ndfa_pct",
+  "Fixed N" = fixedn_column,
+  "Nodule Biomass" = "NoduleBiomass_mg",
+  "Total Biomass" = "TotalBiomass_mg",
+  "Soil N uptake" = "N_soil_uptake_mg",
+  "C/N ratio" = "ShootCN_ratio",
+  "Chlorophyll/SPAD" = "SPAD"
+)
+
+missing_traits <- setdiff(unname(trait_lookup), names(correlation_phys_match))
+if (length(missing_traits) > 0) {
+  stop("Missing required trait column(s): ", paste(missing_traits, collapse = ", "))
+}
+
+drop_const <- function(mat) {
+  sds <- apply(mat, 2, sd, na.rm = TRUE)
+  mat[, sds > 0 & !is.na(sds), drop = FALSE]
+}
+
+format_trait_matrix <- function(trait_df) {
+  trait_mat <- as.matrix(trait_df[, unname(trait_lookup), drop = FALSE])
+  colnames(trait_mat) <- names(trait_lookup)
+  rownames(trait_mat) <- rownames(trait_df)
+
+  # Exclude MTNC181 from Ndfa% only; retain it for all other traits.
+  trait_mat[rownames(trait_mat) == "MTNC181", "Ndfa%"] <- NA_real_
+
+  drop_const(trait_mat)
+}
+
+format_module_trait_cor <- function(me_mat, trait_mat, scope, line_name = NA_character_) {
+  if (nrow(me_mat) < 3 || ncol(trait_mat) == 0) {
+    return(tibble())
+  }
+
+  # Calculate each trait separately so its p-values and sample count reflect
+  # trait-specific missing values and exclusions.
+  purrr::map_dfr(colnames(trait_mat), function(trait_name) {
+    complete_idx <- complete.cases(me_mat, trait_mat[, trait_name])
+    n_complete <- sum(complete_idx)
+    if (n_complete < 3) {
+      return(tibble())
+    }
+
+    trait_cor <- cor(
+      me_mat[complete_idx, , drop = FALSE],
+      trait_mat[complete_idx, trait_name]
+    )
+
+    tibble(
+      Module = rownames(trait_cor),
+      Trait = trait_name,
+      cor = as.numeric(trait_cor),
+      pvalue = as.numeric(corPvalueStudent(trait_cor, n_complete)),
+      n_samples = n_complete
+    )
+  }) %>%
+    dplyr::group_by(Trait) %>%
+    dplyr::mutate(p.adj = p.adjust(pvalue, method = "fdr")) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      Scope = scope,
+      Line = line_name
+    ) %>%
+    dplyr::select(Scope, Line, Module, Trait, cor, pvalue, p.adj, n_samples)
+}
+
+combined_traits_mat <- format_trait_matrix(correlation_phys_match)
+combined_res <- format_module_trait_cor(
+  MEs[rownames(correlation_phys_match), , drop = FALSE],
+  combined_traits_mat,
+  scope = "combined"
+)
+
+line_res_list <- list()
+for (line_name in sort(unique(na.omit(correlation_phys_match$Line)))) {
+  idx_line <- !is.na(correlation_phys_match$Line) & correlation_phys_match$Line == line_name
+  if (sum(idx_line, na.rm = TRUE) < 3) {
+    next
+  }
+
+  phys_line <- correlation_phys_match[idx_line, , drop = FALSE]
+  line_traits_mat <- format_trait_matrix(phys_line)
+
+  # Subset the globally oriented eigengenes so correlation signs remain
+  # directly comparable among All Samples, A17, and sunn.
+  MEs_line <- MEs[rownames(phys_line), , drop = FALSE]
+
+  line_res_list[[line_name]] <- format_module_trait_cor(
+    MEs_line,
+    line_traits_mat,
+    scope = "by_line",
+    line_name = line_name
+  )
+}
+
+by_line_res <- bind_rows(line_res_list) %>%
+  dplyr::filter(!is_grey_module(Module))
+combined_res <- combined_res %>%
+  dplyr::filter(!is_grey_module(Module))
+module_trait_cor_all <- bind_rows(combined_res, by_line_res) %>%
+  dplyr::filter(!is_grey_module(Module))
+
+write_csv(combined_res, file.path(out_dir, "module_trait_cor_combined_TotalBiomass_NoduleBiomass_Ndfa_pct_FixedN_ShootCN_ratio_SoilNUptake_SPAD.csv"))
+write_csv(by_line_res, file.path(out_dir, "module_trait_cor_by_line_TotalBiomass_NoduleBiomass_Ndfa_pct_FixedN_ShootCN_ratio_SoilNUptake_SPAD.csv"))
+write_csv(module_trait_cor_all, file.path(out_dir, "module_trait_cor_all_TotalBiomass_NoduleBiomass_Ndfa_pct_FixedN_ShootCN_ratio_SoilNUptake_SPAD.csv"))
+
+cat("Saved non-grey module-trait correlations, including SPAD.\n")
+```
+
+## Prepare Matrices for Phenotype-Correlation Clustering
+
+```{r prepare-phenotype-correlation-matrices}
+heatmap_df <- module_trait_cor_all %>%
+  dplyr::mutate(
+    ScopeLabel = dplyr::if_else(Scope == "combined", "All Samples", Line)
+  )
+
+scope_levels <- c(
+  "All Samples",
+  "A17",
+  "sunn",
+  sort(setdiff(unique(heatmap_df$ScopeLabel), c("All Samples", "A17", "sunn")))
+)
+
+heatmap_df <- heatmap_df %>%
+  dplyr::mutate(
+    Trait = factor(Trait, levels = names(trait_lookup)),
+    ScopeLabel = factor(ScopeLabel, levels = scope_levels),
+    HeatmapTrait = paste(Trait, ScopeLabel, sep = "_")
+  )
+
+heatmap_col_order <- heatmap_df %>%
+  dplyr::distinct(Trait, ScopeLabel, HeatmapTrait) %>%
+  dplyr::arrange(Trait, ScopeLabel) %>%
+  dplyr::pull(HeatmapTrait)
+
+cor_wide <- heatmap_df %>%
+  dplyr::select(Module, HeatmapTrait, cor) %>%
+  tidyr::pivot_wider(names_from = HeatmapTrait, values_from = cor) %>%
+  dplyr::select(Module, dplyr::all_of(heatmap_col_order))
+
+padj_wide <- heatmap_df %>%
+  dplyr::select(Module, HeatmapTrait, p.adj) %>%
+  tidyr::pivot_wider(names_from = HeatmapTrait, values_from = p.adj) %>%
+  dplyr::select(Module, dplyr::all_of(heatmap_col_order))
+
+cor_mat <- as.matrix(cor_wide %>% dplyr::select(-Module))
+rownames(cor_mat) <- cor_wide$Module
+
+padj_mat <- as.matrix(padj_wide %>% dplyr::select(-Module))
+rownames(padj_mat) <- padj_wide$Module
+padj_mat <- padj_mat[rownames(cor_mat), colnames(cor_mat), drop = FALSE]
+
+column_metadata <- heatmap_df %>%
+  dplyr::distinct(HeatmapTrait, Trait, ScopeLabel) %>%
+  dplyr::filter(HeatmapTrait %in% colnames(cor_mat)) %>%
+  dplyr::arrange(match(HeatmapTrait, colnames(cor_mat)))
+
+column_trait_labels <- as.character(column_metadata$Trait)
+column_scope_labels <- as.character(column_metadata$ScopeLabel)
+
+display_mat <- matrix(
+  paste0(
+    sprintf("%.2f", cor_mat),
+    ifelse(padj_mat < 0.001, "***",
+           ifelse(padj_mat < 0.01, "**",
+                  ifelse(padj_mat < 0.05, "*", "")))
+  ),
+  nrow = nrow(cor_mat),
+  ncol = ncol(cor_mat),
+  dimnames = dimnames(cor_mat)
+)
+display_mat[is.na(cor_mat)] <- ""
+
+```
+
+## Cluster Modules by Phenotype-Correlation Profile
+
+This supervised view groups modules that have similar correlation patterns across traits and the All Samples, A17, and sunn scopes. It is separate from the module-module eigengene correlation clustering above.
+
+```{r module-phenotype-profile-clustering}
+if (nrow(cor_mat) < 2 || ncol(cor_mat) < 2) {
+  stop("At least two modules and two trait-scope combinations are required.")
+}
+
+# Compare each pair of modules across its complete phenotype-correlation
+# profile. Correlation distance emphasizes similarity in response patterns.
+trait_profile_similarity <- stats::cor(
+  t(cor_mat),
+  use = "pairwise.complete.obs"
+)
+
+if (anyNA(trait_profile_similarity)) {
+  warning(
+    "Undefined trait-profile similarities were set to zero before clustering."
+  )
+  trait_profile_similarity[is.na(trait_profile_similarity)] <- 0
+}
+diag(trait_profile_similarity) <- 1
+
+trait_profile_hclust <- hclust(
+  as.dist(1 - trait_profile_similarity),
+  method = "average"
+)
+
+trait_profile_annotation <- column_metadata %>%
+  dplyr::transmute(
+    HeatmapTrait,
+    Trait = as.character(Trait),
+    Scope = as.character(ScopeLabel)
+  ) %>%
+  as.data.frame()
+rownames(trait_profile_annotation) <- trait_profile_annotation$HeatmapTrait
+trait_profile_annotation$HeatmapTrait <- NULL
+trait_profile_annotation <- trait_profile_annotation[
+  colnames(cor_mat),
+  ,
+  drop = FALSE
+]
+
+trait_sequence <- trait_profile_annotation$Trait
+trait_gaps <- which(trait_sequence[-1] != trait_sequence[-length(trait_sequence)])
+
+trait_profile_palette <- grDevices::colorRampPalette(
+  c("#5F8F9A", "grey98", "burlywood3")
+)(101)
+
+# Annotate only FDR-significant module-trait correlations with the correlation
+# value and the same significance stars used in the trait heatmap.
+trait_profile_display <- display_mat[
+  rownames(cor_mat),
+  colnames(cor_mat),
+  drop = FALSE
+]
+trait_profile_display[
+  is.na(padj_mat) | padj_mat >= 0.05
+] <- ""
+
+trait_profile_heatmap <- pheatmap::pheatmap(
+  cor_mat,
+  cluster_rows = trait_profile_hclust,
+  cluster_cols = FALSE,
+  color = trait_profile_palette,
+  breaks = seq(-1, 1, length.out = 102),
+  border_color = "white",
+  annotation_col = trait_profile_annotation,
+  gaps_col = trait_gaps,
+  labels_row = sub("^ME", "", rownames(cor_mat)),
+  labels_col = trait_profile_annotation$Scope,
+  display_numbers = trait_profile_display,
+  number_color = "black",
+  fontsize_number = 6,
+  treeheight_row = 80,
+  fontsize = 8,
+  angle_col = "45",
+  main = "Modules clustered by phenotype-correlation profile",
+  silent = TRUE
+)
+
+grid::grid.newpage()
+grid::grid.draw(trait_profile_heatmap$gtable)
+
+trait_profile_heatmap_file <- file.path(
+  out_dir,
+  "modules_clustered_by_phenotype_correlation_profile.png"
+)
+ggsave(
+  trait_profile_heatmap_file,
+  plot = trait_profile_heatmap$gtable,
+  width = max(11, ncol(cor_mat) * 0.5 + 5),
+  height = max(8, nrow(cor_mat) * 0.3 + 4),
+  units = "in",
+  dpi = 180
+)
+
+trait_profile_module_order <- tibble(
+  ClusterOrder = seq_along(trait_profile_hclust$order),
+  Module = sub(
+    "^ME",
+    "",
+    rownames(cor_mat)[trait_profile_hclust$order]
+  )
+)
+write_csv(
+  trait_profile_module_order,
+  file.path(out_dir, "module_phenotype_profile_cluster_order.csv")
+)
+
+cat("Saved phenotype-profile clustered heatmap to: ",
+    trait_profile_heatmap_file, "\n", sep = "")
+```
+
+##ExamGOEnrichment for module of interest
+
+```{r topgo-load-annotation}
+# Create GO enrichment output directory
+go_out_dir <- file.path(out_dir, "GO_enrichment")
+dir.create(go_out_dir, recursive = TRUE, showWarnings = FALSE)
+cat("GO enrichment output: ", go_out_dir, "\n", sep = "")
+
+# Load GO gene pairs annotation
+go_file <- here("MT_genome", "annotation", "GO_gene_pairs_MtrunA17r5.tsv")
+if (!file.exists(go_file)) {
+  stop("GO annotation file not found: ", go_file)
+}
+go_pairs <- read_tsv(go_file, col_types = cols(.default = col_character()),
+                    show_col_types = FALSE) %>%
+  dplyr::rename(gene = LOCUS_TAG, go = GO) %>%
+  dplyr::filter(!is.na(gene), gene != "", !is.na(go), go != "") %>%
+  dplyr::distinct(gene, go)
+
+# Build GO2genes: list where names are GO IDs, values are gene vectors (required by topGO)
+GO2genes <- split(go_pairs$gene, go_pairs$go)
+cat("GO annotation: ", nrow(go_pairs), " gene-GO pairs, ", length(GO2genes), " GO terms\n", sep = "")
+```
+
+```{r topgo-enrichment}
+library(topGO)
+library(GO.db)
+
+# Every assigned module. Grey is the unclustered WGCNA bin.
+modules_of_interest <- gene_module_df %>%
+  dplyr::filter(module != "grey") %>%
+  dplyr::count(module, name = "n_genes") %>%
+  dplyr::arrange(dplyr::desc(n_genes)) %>%
+  dplyr::pull(module)
+
+all_genes <- colnames(datExpr)
+go_root_ids <- c("GO:0008150", "GO:0003674", "GO:0005575")
+max_annotated <- 300
+
+cat("Running topGO for ", length(modules_of_interest),
+    " modules; universe ", length(all_genes), " genes\n", sep = "")
+
+topgo_bp_all <- list()
+topgo_sig_all <- list()
+
+for (module_label in modules_of_interest) {
+  module_genes <- gene_module_df %>%
+    dplyr::filter(module == module_label) %>%
+    dplyr::pull(gene) %>%
+    unique()
+
+  cat("Module ", module_label, ": ", length(module_genes), " genes\n", sep = "")
+
+  if (length(module_genes) < 5) {
+    cat("  skipped: fewer than 5 genes\n")
+    next
+  }
+
+  gene_list <- setNames(as.integer(all_genes %in% module_genes), all_genes)
+
+  GOdata <- new(
+    "topGOdata",
+    ontology = "BP",
+    allGenes = gene_list,
+    geneSel = function(x) x == 1,
+    annot = annFUN.GO2genes,
+    GO2genes = GO2genes,
+    nodeSize = 5
+  )
+
+  res_fisher <- runTest(GOdata, algorithm = "classic", statistic = "fisher")
+  n_tested <- length(score(res_fisher))
+
+  topgo_bp <- GenTable(
+    GOdata,
+    Fisher = res_fisher,
+    orderBy = "Fisher",
+    ranksOf = "Fisher",
+    topNodes = n_tested,
+    numChar = 200
+  )
+
+  if (nrow(topgo_bp) == 0) {
+    cat("  no tested BP terms\n")
+    next
+  }
+
+  go_info <- AnnotationDbi::select(
+    GO.db,
+    keys = unique(topgo_bp$GO.ID),
+    keytype = "GOID",
+    columns = c("TERM", "ONTOLOGY")
+  ) %>%
+    dplyr::distinct(GOID, .keep_all = TRUE)
+
+  topgo_bp <- topgo_bp %>%
+    dplyr::left_join(go_info %>% dplyr::rename(GO.ID = GOID), by = "GO.ID") %>%
+    dplyr::mutate(
+      Module = module_label,
+      QueryGeneN = length(module_genes),
+      Fisher.pval = dplyr::if_else(grepl("^<", Fisher), 1e-30, as.numeric(Fisher)),
+      n_tested = n_tested,
+      # BH across every tested term. Adjusting only the top 200 preselected
+      # terms treats m as 200 and is too lenient.
+      p.adj = p.adjust(Fisher.pval, method = "BH")
+    ) %>%
+    dplyr::filter(!GO.ID %in% go_root_ids, Annotated <= max_annotated)
+
+  topgo_sig <- topgo_bp %>%
+    dplyr::filter(!is.na(p.adj), p.adj < 0.05) %>%
+    dplyr::arrange(p.adj)
+
+  write_csv(topgo_bp, file.path(go_out_dir, paste0("TopGO_ShootWGCNA_module_", module_label, "_BP.csv")))
+  write_csv(topgo_sig, file.path(go_out_dir, paste0("TopGO_ShootWGCNA_module_", module_label, "_significant.csv")))
+
+  topgo_bp_all[[module_label]] <- topgo_bp
+  topgo_sig_all[[module_label]] <- topgo_sig
+
+  cat("  BH across ", n_tested, " terms; ",
+      nrow(topgo_bp), " retained; ",
+      nrow(topgo_sig), " with p.adj < 0.05\n", sep = "")
+}
+
+topgo_bp <- dplyr::bind_rows(topgo_bp_all)
+topgo_sig <- dplyr::bind_rows(topgo_sig_all)
+
+write_csv(topgo_bp, file.path(go_out_dir, "TopGO_ShootWGCNA_all_modules_BP.csv"))
+write_csv(topgo_sig, file.path(go_out_dir, "TopGO_ShootWGCNA_all_modules_significant.csv"))
+
+cat("TopGO results saved to ", go_out_dir, "\n", sep = "")
+cat("  - ", length(topgo_bp_all), " modules tested\n", sep = "")
+cat("  - ", nrow(topgo_sig), " module-term rows with p.adj < 0.05\n", sep = "")
+```
+
+## Red and Green Module GO Enrichment
+
+```{r plot-red-green-go-enrichment, fig.width=10, fig.height=12}
+if (!requireNamespace("ggtext", quietly = TRUE)) {
+  stop("Package 'ggtext' is required to color GO.ID axis labels by category.")
+}
+
+go_enrichment_dir <- go_out_dir
+go_modules <- c("red", "green")
+
+go_category_levels <- c(
+  "Photosynthesis",
+  "Carbon fixation",
+  "Chlorophyll",
+  "Chloroplast & Plastids",
+  "Amino acid metabolism",
+  "Carbon & energy metabolism",
+  "Nucleotide & RNA metabolism",
+  "Lipid & cofactor metabolism",
+  "Proteostasis & autophagy",
+  "Transport & trafficking",
+  "Signaling, stress & development",
+  "DNA, transcription & cell cycle",
+  "Other cellular processes"
+)
+
+go_category_colors <- c(
+  "Photosynthesis" = "#009E73",
+  "Carbon fixation" = "#56B4E9",
+  "Chlorophyll" = "#66A61E",
+  "Chloroplast & Plastids" = "#1B9E77",
+  "Amino acid metabolism" = "#D95F02",
+  "Carbon & energy metabolism" = "#7570B3",
+  "Nucleotide & RNA metabolism" = "#E6AB02",
+  "Lipid & cofactor metabolism" = "#1F78B4",
+  "Proteostasis & autophagy" = "#E7298A",
+  "Transport & trafficking" = "#66A61E",
+  "Signaling, stress & development" = "#E31A1C",
+  "DNA, transcription & cell cycle" = "#6A3D9A",
+  "Other cellular processes" = "#666666"
+)
+
+classify_go_category <- function(term) {
+  term_lower <- tolower(term)
+
+  dplyr::case_when(
+    grepl(
+      "carbon fixation|calvin|ribulose|rubisco|carboxylation",
+      term_lower
+    ) ~ "Carbon fixation",
+    grepl(
+      "chlorophyll|pigment|tetrapyrrole|porphyrin|heme|protoporphyrin",
+      term_lower
+    ) ~ "Chlorophyll",
+    grepl(
+      "photosynth|photosystem|light reaction",
+      term_lower
+    ) ~ "Photosynthesis",
+    grepl(
+      "chloroplast|plastid|thylakoid",
+      term_lower
+    ) ~ "Chloroplast & Plastids",
+    grepl(
+      "amino acid|aminoacyl|arginine|glutamine|methionine|threonine|isoleucine|tryptophan|homoserine|serine|amine|indol|nitrogen",
+      term_lower
+    ) ~ "Amino acid metabolism",
+    grepl(
+      "respiration|glycol|glucose|pyruvate|tricarbox|oxidative phosphorylation|electron transport|acetyl-coa|energy derivation|glycerol|alditol|dicarbox|monocarbox",
+      term_lower
+    ) ~ "Carbon & energy metabolism",
+    grepl(
+      "nucleotide|nucleoside|nucleobase|ribonucleotide|purine|pyridine|atp|adp|ribose phosphate|organophosphate|rrna|trna|translation|rna capping|rna stability|rna catabolic|rna metabolic|rna destabil",
+      term_lower
+    ) ~ "Nucleotide & RNA metabolism",
+    grepl(
+      "lipid|fatty acid|acyl-coa|phosphatidyl|sterol|palmitoyl|lipoprotein|flavin|riboflavin|molybdopterin|cofactor|prosthetic|pteridine|sulfur",
+      term_lower
+    ) ~ "Lipid & cofactor metabolism",
+    grepl(
+      "autophag|phagophore|proteasom|ubiquitin|protein catabolic|proteolysis|protein folding|protein repair|chaperone|desumoyl|protein modification|dephosphorylation",
+      term_lower
+    ) ~ "Proteostasis & autophagy",
+    grepl(
+      "vacuol|endosom|vesicle|exocyt|secretion|membrane docking|membrane fusion|localization|targeting|transport|protein import|organelle organization",
+      term_lower
+    ) ~ "Transport & trafficking",
+    grepl(
+      "response|stress|starvation|signaling|signal transduction|cell communication|homeostasis|redox|recognition|defense|hypersensitive|chitin|metal ion|circadian|development|pollen|endosperm|seedling",
+      term_lower
+    ) ~ "Signaling, stress & development",
+    grepl(
+      "dna|chromosome|cell cycle|transcription|gene expression",
+      term_lower
+    ) ~ "DNA, transcription & cell cycle",
+    TRUE ~ "Other cellular processes"
+  )
+}
+
+go_enrichment_df <- lapply(
+  go_modules,
+  function(module_name) {
+    go_file <- file.path(
+      go_enrichment_dir,
+      paste0("TopGO_ShootWGCNA_module_", module_name, "_significant.csv")
+    )
+    if (!file.exists(go_file)) {
+      stop("GO enrichment file not found: ", go_file)
+    }
+
+    readr::read_csv(go_file, show_col_types = FALSE) %>%
+      dplyr::mutate(Module = module_name)
+  }
+) %>%
+  dplyr::bind_rows() %>%
+  dplyr::mutate(
+    Module = factor(Module, levels = go_modules),
+    p.adj = as.numeric(p.adj),
+    Fisher.pval = as.numeric(Fisher.pval),
+    Significant = as.numeric(Significant),
+    Expected = as.numeric(Expected),
+    Term = dplyr::coalesce(TERM, Term),
+    plot_p = dplyr::if_else(!is.na(p.adj), p.adj, Fisher.pval),
+    FoldEnrichment = Significant / Expected
+  ) %>%
+  dplyr::filter(
+    is.finite(plot_p),
+    plot_p < 0.05,
+    is.finite(FoldEnrichment),
+    !is.na(GO.ID)
+  ) %>%
+  dplyr::mutate(
+    Category = factor(classify_go_category(Term), levels = go_category_levels),
+    Log10FDR = -log10(pmax(plot_p, .Machine$double.xmin))
+  ) %>%
+  dplyr::arrange(Module, Category, plot_p, dplyr::desc(FoldEnrichment))
+
+readr::write_csv(
+  go_enrichment_df %>%
+    dplyr::transmute(
+      Module,
+      GO.ID,
+      Term,
+      Category,
+      FDR = plot_p,
+      FoldEnrichment,
+      Significant
+    ),
+  file.path(out_dir, "red_green_significant_GO_categories.csv")
+)
+
+go_fdr_limits <- range(go_enrichment_df$Log10FDR, finite = TRUE)
+go_gene_limits <- range(go_enrichment_df$Significant, finite = TRUE)
+go_terms_per_category <- 5L
+
+plot_module_go <- function(module_name) {
+  module_go_df <- go_enrichment_df %>%
+    dplyr::filter(
+      as.character(Module) == module_name,
+      as.character(Category) != "Other cellular processes"
+    ) %>%
+    dplyr::group_by(Category) %>%
+    dplyr::arrange(plot_p, dplyr::desc(FoldEnrichment), .by_group = TRUE) %>%
+    dplyr::slice_head(n = go_terms_per_category) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(Category, plot_p, dplyr::desc(FoldEnrichment)) %>%
+    dplyr::mutate(
+      TermWrapped = vapply(
+        Term,
+        function(x) paste(strwrap(x, width = 42), collapse = "<br>"),
+        character(1)
+      ),
+      TermFacet = paste(GO.ID, TermWrapped, sep = "__"),
+      TermFacet = factor(TermFacet, levels = rev(unique(TermFacet)))
+    )
+
+  go_axis_labels <- stats::setNames(
+    paste0(
+      "<b><span style='color:",
+      unname(go_category_colors[as.character(module_go_df$Category)]),
+      "'>",
+      module_go_df$TermWrapped,
+      "</span></b>"
+    ),
+    as.character(module_go_df$TermFacet)
+  )
+
+  ggplot(
+    module_go_df,
+    aes(
+      x = FoldEnrichment,
+      y = TermFacet,
+      size = Significant,
+      color = Log10FDR
+    )
+  ) +
+    geom_segment(
+      aes(x = 0, xend = FoldEnrichment, yend = TermFacet),
+      color = "grey70",
+      linewidth = 0.4
+    ) +
+    geom_point(
+      aes(x = Inf, fill = Category),
+      shape = 22,
+      alpha = 0
+    ) +
+    geom_point(alpha = 0.9) +
+    scale_y_discrete(labels = go_axis_labels) +
+    scale_color_gradientn(
+      colours = c("#FDE725", "#90D743", "#35B779", "#31688E", "#440154"),
+      name = expression(-log[10]("FDR")),
+      limits = go_fdr_limits
+    ) +
+    scale_fill_manual(
+      name = "GO category",
+      values = go_category_colors,
+      drop = TRUE
+    ) +
+    scale_size_continuous(
+      name = "Significant genes",
+      range = c(1.5, 4.5),
+      limits = go_gene_limits
+    ) +
+    labs(
+      title = paste0(
+        tools::toTitleCase(module_name),
+        " module — top ",
+        go_terms_per_category,
+        " GO terms per category"
+      ),
+      x = "Fold enrichment",
+      y = "GO term"
+    ) +
+    theme_bw(base_size = 8) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 11),
+      panel.grid = element_blank(),
+      axis.title = element_text(face = "bold"),
+      axis.text.x = element_text(size = 7),
+      axis.text.y = ggtext::element_markdown(size = 5.6),
+      legend.position = "right",
+      legend.box = "vertical",
+      plot.margin = margin(4, 8, 4, 4)
+    ) +
+    guides(
+      color = guide_colorbar(order = 1, direction = "vertical"),
+      fill = guide_legend(
+        order = 2,
+        ncol = 1,
+        byrow = TRUE,
+        override.aes = list(alpha = 1, shape = 22, size = 3)
+      ),
+      size = guide_legend(order = 3, ncol = 1)
+    )
+}
+
+red_go_plot <- plot_module_go("red")
+green_go_plot <- plot_module_go("green")
+
+red_go_plot
+green_go_plot
+
+cat(
+  "GO terms plotted: ",
+  paste(
+    names(table(go_enrichment_df$Module)),
+    as.integer(table(go_enrichment_df$Module)),
+    sep = " = ",
+    collapse = "; "
+  ),
+  "\n",
+  sep = ""
+)
+
+```
+
+```{r plot-top-six-go-categories-by-module, fig.width=9, fig.height=10}
+plot_top_six_go_categories <- function(module_name) {
+  top_categories <- go_enrichment_df %>%
+    dplyr::filter(
+      as.character(Module) == module_name,
+      as.character(Category) != "Other cellular processes"
+    ) %>%
+    dplyr::group_by(Category) %>%
+    dplyr::summarise(
+      SignificantGO = dplyr::n_distinct(GO.ID),
+      BestFDR = min(plot_p, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(SignificantGO), BestFDR) %>%
+    dplyr::slice_head(n = 6) %>%
+    dplyr::pull(Category) %>%
+    as.character()
+
+  if (
+    module_name == "red" &&
+    !"Photosynthesis" %in% top_categories &&
+    "Lipid & cofactor metabolism" %in% top_categories
+  ) {
+    top_categories[
+      top_categories == "Lipid & cofactor metabolism"
+    ] <- "Photosynthesis"
+  }
+
+  top_go_df <- go_enrichment_df %>%
+    dplyr::filter(
+      as.character(Module) == module_name,
+      as.character(Category) %in% top_categories
+    ) %>%
+    dplyr::mutate(
+      SelectedCategory = factor(as.character(Category), levels = top_categories)
+    ) %>%
+    dplyr::group_by(SelectedCategory) %>%
+    dplyr::arrange(plot_p, dplyr::desc(FoldEnrichment), .by_group = TRUE) %>%
+    dplyr::slice_head(n = 5) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(SelectedCategory, plot_p, dplyr::desc(FoldEnrichment)) %>%
+    dplyr::mutate(
+      TermWrapped = vapply(
+        Term,
+        function(x) paste(strwrap(x, width = 42), collapse = "<br>"),
+        character(1)
+      ),
+      TermFacet = paste(GO.ID, TermWrapped, sep = "__"),
+      TermFacet = factor(TermFacet, levels = rev(unique(TermFacet)))
+    )
+
+  go_axis_labels <- stats::setNames(
+    paste0(
+      "<b><span style='color:",
+      unname(go_category_colors[as.character(top_go_df$Category)]),
+      "'>",
+      top_go_df$TermWrapped,
+      "</span></b>"
+    ),
+    as.character(top_go_df$TermFacet)
+  )
+
+  ggplot(
+    top_go_df,
+    aes(
+      x = FoldEnrichment,
+      y = TermFacet,
+      size = Significant,
+      color = Log10FDR
+    )
+  ) +
+    geom_segment(
+      aes(x = 0, xend = FoldEnrichment, yend = TermFacet),
+      color = "grey70",
+      linewidth = 0.4
+    ) +
+    geom_point(
+      aes(x = Inf, fill = Category),
+      shape = 22,
+      alpha = 0
+    ) +
+    geom_point(alpha = 0.9) +
+    scale_y_discrete(labels = go_axis_labels) +
+    scale_color_gradientn(
+      colours = c("#FDE725", "#90D743", "#35B779", "#31688E", "#440154"),
+      name = expression(-log[10]("FDR")),
+      limits = go_fdr_limits
+    ) +
+    scale_fill_manual(
+      name = "GO category",
+      values = go_category_colors,
+      drop = TRUE
+    ) +
+    scale_size_continuous(
+      name = "Significant genes",
+      range = c(2, 7),
+      limits = go_gene_limits
+    ) +
+    labs(
+      title = paste0(
+        tools::toTitleCase(module_name),
+        " module — top 6 GO categories (top 5 terms each)"
+      ),
+      x = "Fold enrichment",
+      y = "GO term"
+    ) +
+    theme_bw(base_size = 8) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 11),
+      panel.grid = element_blank(),
+      axis.title = element_text(face = "bold"),
+      axis.text.y = ggtext::element_markdown(size = 7),
+      legend.position = "right",
+      legend.box = "vertical"
+    ) +
+    guides(
+      color = guide_colorbar(order = 1, direction = "vertical"),
+      fill = guide_legend(
+        order = 2,
+        ncol = 1,
+        override.aes = list(alpha = 1, shape = 22, size = 3)
+      ),
+      size = guide_legend(order = 3, ncol = 1)
+    )
+}
+
+red_top_six_categories_plot <- plot_top_six_go_categories("red")
+green_top_six_categories_plot <- plot_top_six_go_categories("green")
+
+red_top_six_categories_plot
+green_top_six_categories_plot
+```
+
