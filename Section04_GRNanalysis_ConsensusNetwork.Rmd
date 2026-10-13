@@ -1,0 +1,548 @@
+---
+title: "Section04_GRNanalysis_ConsensusNetwork"
+output: html_document
+---
+
+Preparation and inference chunks are retained with eval=FALSE. Knitting uses the saved networks and begins consensus analysis after setup.
+
+##Load packages and WGCNA objects from ShootWGCNA
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(here)
+in_dir <- here("Data", "data_for_publication")
+grn_dir <- file.path(in_dir, "GRN_analysis")
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(knitr)
+library(WGCNA)
+
+# Ensure WGCNA's cor is used
+cor <- WGCNA::cor
+```
+
+##Load ShootWGCNA objects
+```{r load-wgcna, eval=FALSE}
+wgcna_rds <- file.path(in_dir, "WGCNA_analysis", "ShootWGCNA_objects.rds")
+
+if (!file.exists(wgcna_rds)) {
+  stop("ShootWGCNA_objects.rds not found. Run Section03_WGCNAnalysis.Rmd first.")
+}
+
+wgcna_obj <- readRDS(wgcna_rds)
+datExpr <- wgcna_obj$datExpr
+moduleColors <- wgcna_obj$moduleColors
+MEs <- wgcna_obj$MEs
+
+cat("Loaded WGCNA objects: ", nrow(datExpr), " samples x ", ncol(datExpr), " genes\n", sep = "")
+cat("Modules: ", paste(unique(moduleColors), collapse = ", "), "\n", sep = "")
+```
+
+##Set Output directory
+
+```{r output-dir}
+out_dir <- grn_dir
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+cat("Output directory: ", out_dir, "\n", sep = "")
+```
+
+##Extract genes from modules correlated with selected traits with r >= |0.5| and p.adj <0.05
+
+```{r select-module-genes, eval=FALSE}
+target_modules <- c(
+  "green", "magenta", "midnightblue", "skyblue", "white",
+  "black", "red", "cyan", "turquoise", "lightcyan",
+  "pink", "royalblue", "darkgreen", "lightyellow", "brown"
+)
+
+gene_ids <- if (!is.null(names(moduleColors))) names(moduleColors) else colnames(datExpr)
+
+if (length(gene_ids) != length(moduleColors)) {
+  stop("Length mismatch between gene IDs and moduleColors.")
+}
+
+selected_module_genes <- tibble(
+  gene_id = gene_ids,
+  module  = moduleColors
+) %>%
+  filter(
+    module %in% target_modules,
+    grepl("^MtrunA17_", gene_id)   # keep only real Medicago gene IDs
+  ) %>%
+  distinct(gene_id, module) %>%
+  arrange(module, gene_id)
+
+module_counts <- selected_module_genes %>%
+  dplyr::count(module, name = "n_genes") %>%
+  arrange(match(module, target_modules))
+
+kable(module_counts, caption = "Gene counts in selected modules")
+cat("Total selected genes: ", nrow(selected_module_genes), "\n", sep = "")
+
+write_csv(selected_module_genes, file.path(out_dir, "selected_module_genes.csv"))
+write_lines(selected_module_genes$gene_id, file.path(out_dir, "selected_module_gene_ids.txt"))
+```
+
+##Map Arabidopsis TFs to Medicago Mt5.0 orthologs
+
+```{r map-at-tfs-to-mt, eval=FALSE}
+at_tf_file <- here("MT_genome", "Athaliana.TFs_mTERFsremoved.csv")
+ortholog_file <- here("MT_genome", "Mt_At_Pv_Ms_Ortholog.csv")
+
+if (!file.exists(at_tf_file)) stop("Missing file: Athaliana.TFs_mTERFsremoved.csv")
+if (!file.exists(ortholog_file)) stop("Missing file: Mt_At_Pv_Ms_Ortholog.csv")
+
+at_tfs <- read_csv(at_tf_file, show_col_types = FALSE) %>%
+  transmute(At_ortholog = toupper(trimws(GeneID))) %>%
+  filter(At_ortholog != "") %>%
+  distinct()
+
+mt_tf_map <- read_csv(ortholog_file, show_col_types = FALSE) %>%
+  dplyr::select(Mt5.0, At_orthologs) %>%
+  filter(!is.na(Mt5.0), Mt5.0 != "", !is.na(At_orthologs), At_orthologs != "") %>%
+  separate_rows(At_orthologs, sep = ";") %>%
+  transmute(
+    Mt5.0 = trimws(Mt5.0),
+    At_ortholog = toupper(trimws(At_orthologs))
+  ) %>%
+  filter(At_ortholog != "") %>%
+  inner_join(at_tfs, by = "At_ortholog") %>%
+  distinct(Mt5.0, At_ortholog)
+
+all_expressed_TFs <- mt_tf_map %>%  # all TFs expressed in your data
+  filter(Mt5.0 %in% colnames(datExpr)) %>%
+  distinct(Mt5.0) %>%
+  pull(Mt5.0) %>%
+  sort()
+
+Mt_TF_list_annotated <- tibble(LOCUS_TAG = all_expressed_TFs) %>%
+  left_join(mt_tf_map, by = c("LOCUS_TAG" = "Mt5.0")) %>%
+  mutate(PRODUCT = NA_character_) %>%
+  dplyr::select(LOCUS_TAG, PRODUCT, At_ortholog)
+
+cat("Total Arabidopsis TFs: ", nrow(at_tfs), "\n", sep = "")
+cat("Mapped Medicago TFs: ", n_distinct(mt_tf_map$Mt5.0), "\n", sep = "")
+cat("Expressed Medicago TFs in dataset: ", length(all_expressed_TFs), "\n", sep = "")
+write_csv(mt_tf_map, file.path(out_dir, "AT_to_Mt5.0_TF_map.csv"))
+write_lines(all_expressed_TFs, file.path(out_dir, "Mt5.0_TF_ids_in_expression.txt"))
+write_csv(Mt_TF_list_annotated, file.path(out_dir, "Mt_TF_annotation.csv"))
+```
+##Prepare data needed for network inference
+
+```{r prepare-network-inference-data, eval=FALSE}
+network_out <- file.path(grn_dir, "network_inference_inputs")
+dir.create(network_out, recursive = TRUE, showWarnings = FALSE)
+
+module_gene_ids <- selected_module_genes %>%
+  distinct(gene_id) %>%
+  pull(gene_id) %>%
+  sort()
+
+deg_file <- file.path(in_dir, "DEG_analysis", "DEG_all_coefficients_combined.csv")
+if (!file.exists(deg_file)) {
+  stop("DEG file not found: ", deg_file)
+}
+
+deg_gene_ids <- read_csv(deg_file, show_col_types = FALSE) %>%
+  filter(
+    gene %in% colnames(datExpr),
+    grepl("^MtrunA17_", gene)
+  ) %>%
+  distinct(gene) %>%
+  pull(gene) %>%
+  sort()
+
+deg_only_gene_ids <- setdiff(deg_gene_ids, module_gene_ids)
+network_target_ids <- sort(union(module_gene_ids, deg_gene_ids))
+
+# Keep the TF regulator input unchanged; add all expressed DEGs as network targets.
+network_gene_ids <- union(network_target_ids, all_expressed_TFs)
+network_expr_matrix <- t(datExpr)[network_gene_ids, , drop = FALSE]
+
+expr_with_gene <- cbind(Gene = rownames(network_expr_matrix), network_expr_matrix)
+
+write_lines(all_expressed_TFs, file.path(network_out, "GENIE3_CLR_TF_list.txt"))
+write_lines(network_target_ids, file.path(network_out, "network_target_gene_ids.txt"))
+write_lines(deg_only_gene_ids, file.path(network_out, "DEG_gene_ids_outside_selected_modules.txt"))
+
+write.csv(network_expr_matrix, file.path(network_out, "GENIE3_CLR_expression_matrix.csv"), row.names = TRUE)
+write.table(expr_with_gene, file.path(network_out, "ARACNE_expression_matrix.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(expr_with_gene, file.path(network_out, "OutPredict_expression_matrix.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(all_expressed_TFs, file.path(network_out, "ARACNE_TF_list.txt"),
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+write.table(all_expressed_TFs, file.path(network_out, "OutPredict_TF_list.tsv"),
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+cat("Total expressed genes: ", ncol(datExpr), "\n",
+    "Selected module genes: ", length(module_gene_ids), "\n",
+    "Expressed DEG genes outside selected modules: ", length(deg_only_gene_ids), "\n",
+    "Network target genes (module genes + DEGs): ", length(network_target_ids), "\n",
+    "TF regulators: ", length(all_expressed_TFs), "\n",
+    "Network genes: ", nrow(network_expr_matrix), "\n",
+    "Saved to: ", network_out, "\n", sep = "")
+```
+
+## 5. Run network inference (CLR and GENIE3)
+
+```{r run-network-inference-clr, eval=FALSE}
+library(minet)
+
+# CLR expects samples x genes
+expr_for_clr <- t(network_expr_matrix)
+dim(expr_for_clr)
+
+clr_mim <- build.mim(expr_for_clr, estimator = "spearman")
+clr_network <- clr(clr_mim)
+
+clr_links <- as.data.frame(as.table(clr_network))
+colnames(clr_links) <- c("regulatoryGene", "targetGene", "weight")
+
+# Keep only the unchanged TF regulators, module/DEG targets, and exclude self-regulation
+clr_links <- clr_links[clr_links$regulatoryGene %in% all_expressed_TFs, ]
+clr_links <- clr_links[clr_links$targetGene %in% network_target_ids, ]
+clr_links <- clr_links[clr_links$regulatoryGene != clr_links$targetGene, ]
+
+cat("CLR edges (after removing self edges): ", nrow(clr_links), "\n", sep = "")
+hist(clr_links$weight, breaks = 50, main = "CLR link weights")
+```
+
+```{r run-network-inference-genie3, eval=FALSE}
+library(GENIE3)
+
+n_cores <- max(1, parallel::detectCores() - 1)
+weight_matrix <- GENIE3(
+  network_expr_matrix,
+  regulators = all_expressed_TFs,
+  nTrees = 1000,
+  nCores = n_cores
+)
+
+tf_in_matrix <- intersect(all_expressed_TFs, rownames(weight_matrix))
+target_in_matrix <- intersect(network_target_ids, colnames(weight_matrix))
+genie3_sub <- weight_matrix[tf_in_matrix, target_in_matrix, drop = FALSE]
+genie3_links <- as.data.frame(as.table(genie3_sub), stringsAsFactors = FALSE)
+colnames(genie3_links) <- c("regulatoryGene", "targetGene", "weight")
+genie3_links <- genie3_links[genie3_links$regulatoryGene != genie3_links$targetGene, ]
+
+cat("GENIE3 edges (after removing self edges): ", nrow(genie3_links), "\n", sep = "")
+hist(genie3_links$weight, breaks = 50, main = "GENIE3 link weights")
+``` 
+
+```{r export-network-results, eval=FALSE}
+network_results_out <- file.path(grn_dir, "network_inference_results")
+dir.create(network_results_out, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(clr_links, file.path(network_results_out, "CLR_network.csv"), row.names = FALSE)
+write.csv(genie3_links, file.path(network_results_out, "GENIE3_network.csv"), row.names = FALSE)
+
+cat("Saved network results to: ", network_results_out, "\n", sep = "")
+```
+
+
+```{bash, Network Inferrence, ARACNE Network, eval=FALSE}
+#Go to command prompt
+
+cd "C:\Users\11579\ARACNe-AP-master\ARACNe-AP-master"
+
+java -Xmx8G -cp .;lib\\commons-lang3-3.3.2.jar;lib\\commons-math3-3.4.1.jar;lib\\jargs.jar aracne.Aracne ^
+ -e "C:\\Users\\11579\\Desktop\\A17_sunn_organized\\Data\\data_for_publication\\GRN_analysis\\network_inference_inputs\\ARACNE_expression_matrix.tsv" ^
+ -o "C:\\Users\\11579\\Desktop\\A17_sunn_organized\\Data\\data_for_publication\\GRN_analysis\\network_inference_results" ^
+ -t "C:\\Users\\11579\\Desktop\\A17_sunn_organized\\Data\\data_for_publication\\GRN_analysis\\network_inference_inputs\\ARACNE_TF_list.txt" ^
+ -p 1E-8 ^
+  --seed 1 ^
+  --calculateThreshold 
+
+#output will give a threshold, we want to save all edge even is not good, so go to the created file and change the MI value to 0.0
+
+java -Xmx8G -cp .;lib\\commons-lang3-3.3.2.jar;lib\\commons-math3-3.4.1.jar;lib\\jargs.jar aracne.Aracne ^
+ -e "C:\\Users\\11579\\Desktop\\A17_sunn_organized\\Data\\data_for_publication\\GRN_analysis\\network_inference_inputs\\ARACNE_expression_matrix.tsv" ^
+ -o "C:\\Users\\11579\\Desktop\\A17_sunn_organized\\Data\\data_for_publication\\GRN_analysis\\network_inference_results" ^
+ -t "C:\\Users\\11579\\Desktop\\A17_sunn_organized\\Data\\data_for_publication\\GRN_analysis\\network_inference_inputs\\ARACNE_TF_list.txt" ^
+ -p 1E-8 ^
+ --threads 8 ^
+ --nobootstrap ^
+ --nodpi
+```
+
+```{r plot-aracne-weight-histogram, eval=FALSE}
+#Command Prompt Output:
+# MI threshold file is present
+# Calculate network from: C:\Users\11579\Desktop\A17_sunn_organized\Data\data_for_publication\GRN_analysis\network_inference_inputs\ARACNE_expression_matrix.tsv
+# TFs processed: 1087
+# Time elapsed for calculating MI: 7 sec
+# 
+# Edges removed by DPI:   0
+# Final Network size:     14271223
+# Total time elapsed: 13 sec
+
+aracne_file <- file.path(grn_dir, "network_inference_results", "ARACNE_network.txt")
+
+if (!file.exists(aracne_file)) {
+  stop("ARACNE network file not found: ", aracne_file)
+}
+
+aracne_links <- read.delim(
+  aracne_file,
+  header = FALSE,
+  sep = "\t",
+  stringsAsFactors = FALSE
+)
+
+if (ncol(aracne_links) < 3) {
+  stop("Expected at least 3 columns in ARACNE network file.")
+}
+
+colnames(aracne_links)[1:3] <- c("regulatoryGene", "targetGene", "weight")
+aracne_links$weight <- suppressWarnings(as.numeric(aracne_links$weight))
+aracne_links <- aracne_links[!is.na(aracne_links$weight), , drop = FALSE]
+
+aracne_links <- aracne_links[aracne_links$regulatoryGene %in% all_expressed_TFs, , drop = FALSE]
+aracne_links <- aracne_links[aracne_links$targetGene %in% network_target_ids, , drop = FALSE]
+aracne_links <- aracne_links[aracne_links$regulatoryGene != aracne_links$targetGene, , drop = FALSE]
+
+cat("ARACNE edges after TF/module/self filtering: ", nrow(aracne_links), "\n", sep = "")
+
+cat("ARACNE edges with numeric weights: ", nrow(aracne_links), "\n", sep = "")
+hist(aracne_links$weight, breaks = 50, main = "ARACNE link weights", xlab = "MI weight")
+
+write.csv(aracne_links, file.path(network_results_out, "ARACNE_network.csv"), row.names = FALSE)
+```
+
+Outpredict preparation
+```{r prepare-outpredict-metadata, eval=FALSE}
+sample_names <- colnames(network_expr_matrix)
+meta_data <- data.frame(
+  isTs = "FALSE",
+  is1stLast = "e",
+  prevCol = NA,
+  del.t = NA,
+  condName = sample_names,
+  stringsAsFactors = FALSE
+)
+
+write.table(
+  meta_data,
+  file.path(network_out, "meta_data.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+cat("Saved OutPredict metadata: ", file.path(network_out, "meta_data.tsv"), "\n", sep = "")
+```
+
+```{python, constructing outpredict network, eval=FALSE}
+#\\wsl.localhost\Ubuntu\home\yuchen_\OutPredict\OP_3
+##When running Outpredict, your sample should be in the OP_3/Datasets
+#Go to Ubuntu -> allows UNIX environment on the computer. I previously had installed outpredict on this desktop. if you open up Ubuntu, write "ls", it will give folder named OutPredict
+#Cd outpredict folder, there is OP_3 folder, sample should be in the OP_3/Datasets folder
+#To prepare the dataset for Outpredict, input this "explorer.exe ." to open up current destination as a folder, then drag your datasets into the platform
+
+#files need to be exactly (tf_names.tsv. meta_data.tsv, and expression.tsv)
+
+#Below is the py script to run - without prior, change input dir using "nano pipeline_MT.py"
+#Press Ctrl + O, then Enter to save Press Ctrl + X to exit
+from OutPredict import OutPredict
+
+if __name__ == '__main__':
+    op = OutPredict()
+
+    op.input_dir_name = "A17_sunn_data_03172026" #all your input files, change name accordingly
+    op.num_of_trees = 300
+    op.test_set_split_ratio = 0.15
+    op.training_data_type = "SS"
+    op.leave_out_data_type = "SS"
+    op.genes_coeff_of_var_threshold = 0
+    op.num_of_cores = 8
+
+    op.run()
+    
+#run the command line https://github.com/jacirrone/OutPredict
+cd OP_3/
+conda activate op3
+python -s pipeline_MT.py
+
+#output will be in the output directory- take out the output folder in the folder on your own PC. Later you will need to mannually remove the self-regulation effect
+```
+
+```{r clean-outpredict-network-and-plot, eval=FALSE}
+outpredict_file <- file.path(grn_dir, "network_inference_results", "OutPredict_network.csv")
+if (!file.exists(outpredict_file)) stop("OutPredict network file not found: ", outpredict_file)
+
+outpredict_links <- read.csv(outpredict_file, stringsAsFactors = FALSE, check.names = FALSE)
+
+colnames(outpredict_links)[1:3] <- c("regulatoryGene", "targetGene", "weight")
+outpredict_links$weight <- suppressWarnings(as.numeric(outpredict_links$weight))
+
+cat("Raw OutPredict edges: ", nrow(outpredict_links), "\n", sep = "")
+
+outpredict_links_filt <- outpredict_links %>%
+  dplyr::filter(
+    regulatoryGene %in% all_expressed_TFs,
+    targetGene %in% network_target_ids,
+    regulatoryGene != targetGene
+  )
+
+cat("Filtered OutPredict edges: ", nrow(outpredict_links_filt), "\n", sep = "")
+
+hist(outpredict_links_filt$weight, breaks = 50, main = "OutPredict link weights", xlab = "Weight")
+
+write.csv(
+  outpredict_links_filt,
+  file.path(network_results_out, "OutPredict_network.csv"),
+  row.names = FALSE
+)
+```
+
+## Constructing Consensus Network using Ranking from CLR, GENIE3, ARACNE, and OutPredict
+
+```{r load-tf-candidates}
+tf_file <- file.path(grn_dir, "network_inference_inputs", "GENIE3_CLR_TF_list.txt")
+deg_file <- file.path(in_dir, "DEG_analysis", "DEG_all_coefficients_combined.csv")
+required_inputs <- c(tf_file, deg_file)
+missing_inputs <- required_inputs[!file.exists(required_inputs)]
+if (length(missing_inputs) > 0) {
+  stop("Missing consensus input(s):\n", paste(missing_inputs, collapse = "\n"))
+}
+Mt_TF_candidates <- tibble(Mt5.0 = trimws(read_lines(tf_file))) %>%
+  filter(!is.na(Mt5.0), Mt5.0 != "") %>%
+  distinct()
+# Saved TF candidates already restrict regulators to expressed genes.
+deg_gene_ids <- read_csv(deg_file, show_col_types = FALSE) %>%
+  filter(!is.na(gene), grepl("^MtrunA17_", gene)) %>%
+  distinct(gene) %>%
+  pull(gene) %>%
+  sort()
+cat("Loaded TF candidates:", nrow(Mt_TF_candidates), "\n")
+```
+
+```{r load-network-results-and-preprocess}
+network_dir <- file.path(grn_dir, "network_inference_results")
+
+clr_file <- file.path(network_dir, "CLR_network.csv")
+genie3_file <- file.path(network_dir, "GENIE3_network.csv")
+aracne_file <- file.path(network_dir, "ARACNE_network.csv")
+outpredict_file <- file.path(network_dir, "OutPredict_network.csv")
+
+required_files <- c(clr_file, genie3_file, aracne_file, outpredict_file)
+missing_files <- required_files[!file.exists(required_files)]
+if (length(missing_files) > 0) {
+  stop("Missing network file(s):\n", paste(missing_files, collapse = "\n"))
+}
+
+clr <- read_csv(clr_file, show_col_types = FALSE) %>%
+  mutate(CLR_Rank = rank(-weight)) %>%
+  filter(regulatoryGene %in% Mt_TF_candidates$Mt5.0)
+
+genie3 <- read_csv(genie3_file, show_col_types = FALSE) %>%
+  mutate(genie3_Rank = rank(-weight)) %>%
+  filter(regulatoryGene %in% Mt_TF_candidates$Mt5.0)
+
+aracne <- read_csv(aracne_file, show_col_types = FALSE) %>%
+  mutate(aracne_Rank = rank(-weight)) %>%
+  filter(regulatoryGene %in% Mt_TF_candidates$Mt5.0)
+
+outpredict <- read_csv(outpredict_file, show_col_types = FALSE) %>%
+  mutate(outpredict_Rank = rank(-weight)) %>%
+  filter(regulatoryGene %in% Mt_TF_candidates$Mt5.0)
+```
+
+```{r construct-consensus-network}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+})
+
+report_network_counts <- function(network_df, label) {
+  n_tfs <- n_distinct(network_df$regulatoryGene[!is.na(network_df$regulatoryGene)])
+  n_targets <- n_distinct(network_df$targetGene[!is.na(network_df$targetGene)])
+  n_edges <- nrow(network_df)
+  cat(label, "\n")
+  cat("  Number of TFs:", n_tfs, "\n")
+  cat("  Number of target genes:", n_targets, "\n")
+  cat("  Number of edges:", n_edges, "\n")
+}
+
+consensus <- clr %>%
+  dplyr::select(regulatoryGene, targetGene, CLR_Rank) %>%
+  dplyr::full_join(
+    genie3 %>% dplyr::select(regulatoryGene, targetGene, genie3_Rank),
+    by = c("regulatoryGene", "targetGene")
+  ) %>%
+  dplyr::full_join(
+    aracne %>% dplyr::select(regulatoryGene, targetGene, aracne_Rank),
+    by = c("regulatoryGene", "targetGene")
+  ) %>%
+  dplyr::full_join(
+    outpredict %>% dplyr::select(regulatoryGene, targetGene, outpredict_Rank),
+    by = c("regulatoryGene", "targetGene")
+  ) %>%
+  mutate(GeoMeanRank = (outpredict_Rank * genie3_Rank * aracne_Rank * CLR_Rank)^(1 / 4))
+
+report_network_counts(consensus, "Step 1: Big consensus network")
+
+deg_genes <- deg_gene_ids
+
+consensus_deg_tf <- consensus %>%
+  filter(regulatoryGene %in% deg_genes)
+
+report_network_counts(consensus_deg_tf, "Step 2: Consensus network after keeping DEG TF regulators only")
+
+threshold <- quantile(consensus_deg_tf$GeoMeanRank, 0.03, na.rm = TRUE)
+
+# Filter the top 3% strongest consensus edges after DEG TF filtering
+consensus_filtered <- consensus_deg_tf %>%
+  filter(GeoMeanRank <= threshold)
+
+report_network_counts(consensus_filtered, "Step 3: DEG-TF consensus network filtered to top 3% edges")
+
+consensus_tf <- unique(consensus_filtered$regulatoryGene)
+```
+
+
+```{r plot-network-degree}
+degree_df <- consensus_filtered %>%
+  filter(!is.na(regulatoryGene), !is.na(targetGene))
+out_degree <- degree_df %>%
+  dplyr::count(regulatoryGene, name = "out_degree")
+in_degree <- degree_df %>%
+  dplyr::count(targetGene, name = "in_degree")
+cat("Out-degree nodes (TFs):", nrow(out_degree), "\n")
+cat("In-degree nodes (targets):", nrow(in_degree), "\n")
+
+old_par <- par(no.readonly = TRUE)
+par(mfrow = c(1, 2))
+hist(
+  out_degree$out_degree,
+  breaks = 40,
+  col = "steelblue",
+  border = "white",
+  main = "Out-degree distribution",
+  xlab = "Out-degree (edges per TF)"
+)
+hist(
+  in_degree$in_degree,
+  breaks = 40,
+  col = "darkorange",
+  border = "white",
+  main = "In-degree distribution",
+  xlab = "In-degree (edges per target)"
+)
+par(old_par)
+```
+```{r save-consensus-output}
+out_dir <- file.path(grn_dir, "consensus_network")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+#write_csv(consensus, file.path(out_dir, "consensus_network_all_edges.csv"))
+#write_csv(consensus_deg_tf, file.path(out_dir, "consensus_network_deg_tf_edges.csv"))
+#write_csv(consensus_filtered, file.path(out_dir, "consensus_network_deg_tf_top3pct_edges.csv"))
+#write_lines(consensus_tf, file.path(out_dir, "consensus_network_unique_TFs.txt"))
+
+cat("Saved consensus outputs to:", out_dir, "\n")
+```
+
+
