@@ -1,0 +1,9 @@
+RNAseqID_rowname,RNAseqID,Construct,Replicate,Group,LeafNode
+MT05,MT05,MtNAC11,1,TF,2
+MT09,MT09,Empty,1,Control,2
+MT14,MT14,MtNAC11,2,TF,3
+MT18,MT18,Empty,2,Control,3
+MT23,MT23,MtNAC11,3,TF,3
+MT27,MT27,Empty,3,Control,3
+MT32,MT32,MtNAC11,4,TF,3
+MT36,MT36,Empty,4,Control,2
