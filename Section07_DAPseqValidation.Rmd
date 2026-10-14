@@ -1,0 +1,1602 @@
+---
+title: "Section07_DAPseqValidation"
+author: "Yuchen Wang"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.path = "../../Data/data_for_publication/DAPseq_validation/figures/"
+)
+
+library(here)
+here::i_am("Script/script_for_publication/Section07_DAPseqValidation.Rmd")
+project_library <- here(".r-library", paste(R.version$major,
+  strsplit(R.version$minor, "\\.")[[1]][1], sep = "."))
+if (dir.exists(project_library)) .libPaths(c(project_library, .libPaths()))
+required_packages <- c(
+  "dplyr", "ggplot2", "GO.db", "here", "purrr", "readr",
+  "stringr", "topGO"
+)
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the required packages before knitting: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(GO.db)
+  library(here)
+  library(purrr)
+  library(readr)
+  library(stringr)
+  library(topGO)
+})
+
+tf_names <- c("NAC1", "NAC11")
+
+publication_dir <- here("Data", "data_for_publication", "DAPseq_validation")
+dapseq_dir <- file.path(publication_dir, "inputs", "DAPseq")
+output_dir <- publication_dir
+figure_dir <- file.path(output_dir, "figures")
+table_dir <- file.path(output_dir, "tables")
+
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+normalize_gene_id <- function(x) {
+  x <- trimws(as.character(x))
+  sub("^MtrunA17(?=(Chr|CP|MT))", "MtrunA17_", x, perl = TRUE)
+}
+```
+
+# Load DAP-seq peaks and define 1 kb promoter targets
+
+NAC11 is the historical input label for MtNAC47. Promoter targets require a
+promoter-annotated peak strictly less than 1 kb from the transcription start site.
+
+```{r load-input-data}
+dapseq_files <- setNames(
+  file.path(dapseq_dir, paste0(tf_names, "_annotated3.csv")), tf_names
+)
+missing_input_files <- dapseq_files[!file.exists(dapseq_files)]
+if (length(missing_input_files) > 0L) {
+  stop("Missing required input file(s): ", paste(missing_input_files, collapse = ", "))
+}
+dapseq_data <- imap(dapseq_files, function(path, tf_name) {
+  read_csv(path, show_col_types = FALSE) %>%
+    mutate(TF = tf_name, geneId_original = as.character(geneId),
+           geneId = normalize_gene_id(geneId)) %>% relocate(TF)
+})
+dapseq_all <- bind_rows(dapseq_data)
+promoter_targets_under_1kb <- imap_dfr(
+  dapseq_data,
+  function(peak_table, tf_name) {
+    peak_table %>%
+      filter(
+        str_detect(as.character(annotation), regex("^Promoter", ignore_case = TRUE)),
+        !is.na(distanceToTSS),
+        abs(as.numeric(distanceToTSS)) < 1000,
+        !is.na(geneId),
+        geneId != ""
+      ) %>%
+      transmute(TF = tf_name, geneId) %>%
+      distinct()
+  }
+)
+
+```
+```{r prepare-go-annotation, include=FALSE}
+go_pairs_file <- file.path(publication_dir, "inputs", "annotation", "GO_gene_pairs_MtrunA17r5.tsv")
+if (!file.exists(go_pairs_file)) {
+  stop("GO annotation file is missing: ", go_pairs_file)
+}
+
+go_pairs <- read_tsv(
+  go_pairs_file,
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE
+) %>%
+  transmute(
+    geneId = normalize_gene_id(LOCUS_TAG),
+    GO = as.character(GO)
+  ) %>%
+  filter(
+    !is.na(geneId),
+    geneId != "",
+    !is.na(GO),
+    GO != ""
+  ) %>%
+  distinct(geneId, GO)
+
+GO2genes <- split(go_pairs$geneId, go_pairs$GO)
+go_universe <- sort(unique(go_pairs$geneId))
+
+parse_topgo_pvalue <- function(x) {
+  x <- as.character(x)
+  ifelse(
+    str_detect(x, "^<"),
+    suppressWarnings(as.numeric(str_remove(x, "^<"))),
+    suppressWarnings(as.numeric(x))
+  )
+}
+
+```
+# Proportion of DAP-seq peaks in genomic regions
+
+Each peak is counted once in the genomic feature stored in its `annotation`
+column. Gene-specific exon and intron calls are collapsed to Exon and Intron.
+Downstream peaks are those annotated as `Downstream (<=300bp)`. NAC11 is shown
+as MtNAC47.
+
+```{r plot-dapseq-peak-genomic-regions, fig.width=7.2, fig.height=5.2}
+genomic_region_levels <- c(
+  "Promoter",
+  "5' UTR",
+  "Exon",
+  "Intron",
+  "3' UTR",
+  "Downstream (<=300 bp)",
+  "Distal intergenic"
+)
+
+assign_genomic_region <- function(annotation) {
+  annotation <- as.character(annotation)
+  case_when(
+    str_detect(annotation, regex("^Promoter", ignore_case = TRUE)) ~ "Promoter",
+    str_detect(annotation, regex("^5' UTR", ignore_case = TRUE)) ~ "5' UTR",
+    str_detect(annotation, regex("^Exon", ignore_case = TRUE)) ~ "Exon",
+    str_detect(annotation, regex("^Intron", ignore_case = TRUE)) ~ "Intron",
+    str_detect(annotation, regex("^3' UTR", ignore_case = TRUE)) ~ "3' UTR",
+    str_detect(annotation, regex("^Downstream", ignore_case = TRUE)) ~
+      "Downstream (<=300 bp)",
+    str_detect(annotation, regex("^Distal Intergenic", ignore_case = TRUE)) ~
+      "Distal intergenic",
+    TRUE ~ NA_character_
+  )
+}
+
+peak_genomic_regions <- dapseq_all %>%
+  mutate(
+    genomic_region = assign_genomic_region(annotation),
+    TF_label = recode(
+      TF,
+      "NAC1" = "MtNAC1",
+      "NAC11" = "MtNAC47"
+    )
+  )
+
+unknown_region_count <- sum(is.na(peak_genomic_regions$genomic_region))
+if (unknown_region_count > 0L) {
+  unknown_annotations <- peak_genomic_regions %>%
+    filter(is.na(genomic_region)) %>%
+    distinct(annotation) %>%
+    pull(annotation)
+  stop(
+    "Unassigned genomic-region annotation(s): ",
+    paste(head(unknown_annotations, 10), collapse = "; ")
+  )
+}
+
+peak_genomic_region_counts <- peak_genomic_regions %>%
+  count(TF, TF_label, genomic_region, name = "peak_count") %>%
+  group_by(TF) %>%
+  mutate(
+    total_peaks = sum(peak_count),
+    proportion = peak_count / total_peaks,
+    percentage = 100 * proportion
+  ) %>%
+  ungroup() %>%
+  mutate(
+    TF_label = factor(TF_label, levels = c("MtNAC1", "MtNAC47")),
+    genomic_region = factor(genomic_region, levels = genomic_region_levels)
+  ) %>%
+  arrange(TF_label, genomic_region) %>%
+  group_by(TF_label) %>%
+  mutate(
+    ymax = cumsum(proportion),
+    ymin = ymax - proportion,
+    label_y = (ymin + ymax) / 2,
+    label_color = if_else(
+      genomic_region %in% c("Promoter", "Intron", "3' UTR"),
+      "white",
+      "grey20"
+    )
+  ) %>%
+  ungroup()
+
+if (any(abs(tapply(
+  peak_genomic_region_counts$proportion,
+  peak_genomic_region_counts$TF,
+  sum
+) - 1) > 1e-8)) {
+  stop("Genomic-region proportions do not sum to 1 for every TF.")
+}
+
+write_csv(
+  peak_genomic_region_counts %>%
+    mutate(
+      TF_label = as.character(TF_label),
+      genomic_region = as.character(genomic_region)
+    ) %>%
+    dplyr::select(
+      TF,
+      TF_label,
+      genomic_region,
+      peak_count,
+      total_peaks,
+      proportion,
+      percentage
+    ),
+  file.path(
+    table_dir,
+    "MtNAC1_MtNAC47_DAPseq_peak_genomic_region_proportions.csv"
+  )
+)
+
+peak_genomic_region_plot <- ggplot(
+  peak_genomic_region_counts,
+  aes(x = as.numeric(TF_label), fill = genomic_region)
+) +
+  geom_rect(
+    aes(
+      xmin = as.numeric(TF_label) - 0.31,
+      xmax = as.numeric(TF_label) + 0.31,
+      ymin = ymin,
+      ymax = ymax
+    ),
+    color = "white",
+    linewidth = 0.3
+  ) +
+  geom_text(
+    aes(
+      y = label_y,
+      label = if_else(
+        proportion >= 0.04,
+        sprintf("%.1f%%", percentage),
+        ""
+      ),
+      color = label_color
+    ),
+    size = 3.1,
+    fontface = "bold",
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    breaks = seq_along(levels(peak_genomic_region_counts$TF_label)),
+    labels = levels(peak_genomic_region_counts$TF_label),
+    expand = expansion(add = 0.65)
+  ) +
+  scale_y_continuous(
+    labels = function(x) paste0(round(100 * x), "%"),
+    breaks = seq(0, 1, by = 0.25),
+    expand = c(0, 0)
+  ) +
+  coord_cartesian(ylim = c(0, 1), clip = "off") +
+  scale_fill_manual(
+    values = c(
+      "Promoter" = "#E64B35",
+      "5' UTR" = "#F39B7F",
+      "Exon" = "#4DBBD5",
+      "Intron" = "#3C5488",
+      "3' UTR" = "#00A087",
+      "Downstream (<=300 bp)" = "#8491B4",
+      "Distal intergenic" = "#B8B8B8"
+    ),
+    name = "Genomic region",
+    drop = FALSE
+  ) +
+  scale_color_identity() +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  labs(
+    title = "Proportion of DAP-seq peaks in genomic regions",
+    x = NULL,
+    y = "Proportion of peaks"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(face = "bold"),
+    legend.position = "right",
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+ggsave(
+  file.path(
+    figure_dir,
+    "MtNAC1_MtNAC47_DAPseq_peak_genomic_region_proportions.png"
+  ),
+  peak_genomic_region_plot,
+  width = 7.2,
+  height = 5.2,
+  dpi = 600,
+  bg = "white"
+)
+ggsave(
+  file.path(
+    figure_dir,
+    "MtNAC1_MtNAC47_DAPseq_peak_genomic_region_proportions.pdf"
+  ),
+  peak_genomic_region_plot,
+  width = 7.2,
+  height = 5.2,
+  bg = "white"
+)
+
+peak_genomic_region_plot
+knitr::kable(
+  peak_genomic_region_counts %>%
+    mutate(
+      percentage = round(percentage, 1)
+    ) %>%
+    dplyr::select(
+      TF = TF_label,
+      `Genomic region` = genomic_region,
+      Peaks = peak_count,
+      `Percentage` = percentage
+    ),
+  align = c("l", "l", "r", "r"),
+  caption = "DAP-seq peaks assigned to each genomic region"
+)
+```
+
+# Overlap of 1 kb promoter targets
+
+Unique genes with a promoter-annotated DAP-seq peak strictly less than 1 kb
+from the transcription start site are compared between MtNAC1 and MtNAC47.
+A gene with several qualifying peaks is counted once per TF.
+
+```{r venn-promoter-targets-under-1kb, fig.width=6.4, fig.height=5.4}
+nac1_promoter_1kb <- promoter_targets_under_1kb %>%
+  filter(TF == "NAC1") %>%
+  pull(geneId) %>%
+  unique()
+nac47_promoter_1kb <- promoter_targets_under_1kb %>%
+  filter(TF == "NAC11") %>%
+  pull(geneId) %>%
+  unique()
+
+promoter_1kb_only_nac1 <- setdiff(nac1_promoter_1kb, nac47_promoter_1kb)
+promoter_1kb_only_nac47 <- setdiff(nac47_promoter_1kb, nac1_promoter_1kb)
+promoter_1kb_shared <- intersect(nac1_promoter_1kb, nac47_promoter_1kb)
+
+promoter_1kb_overlap_genes <- tibble(
+  geneId = union(nac1_promoter_1kb, nac47_promoter_1kb),
+  in_MtNAC1 = geneId %in% nac1_promoter_1kb,
+  in_MtNAC47 = geneId %in% nac47_promoter_1kb
+) %>%
+  mutate(
+    overlap_group = case_when(
+      in_MtNAC1 & in_MtNAC47 ~ "Shared",
+      in_MtNAC1 ~ "MtNAC1 only",
+      in_MtNAC47 ~ "MtNAC47 only"
+    )
+  ) %>%
+  arrange(overlap_group, geneId)
+
+promoter_1kb_overlap_summary <- promoter_1kb_overlap_genes %>%
+  count(overlap_group, name = "gene_count") %>%
+  mutate(
+    overlap_group = factor(
+      overlap_group,
+      levels = c("MtNAC1 only", "Shared", "MtNAC47 only")
+    )
+  ) %>%
+  arrange(overlap_group) %>%
+  mutate(
+    MtNAC1_promoter_targets = length(nac1_promoter_1kb),
+    MtNAC47_promoter_targets = length(nac47_promoter_1kb)
+  )
+
+write_csv(
+  promoter_1kb_overlap_genes,
+  file.path(
+    table_dir,
+    "MtNAC1_MtNAC47_promoter_under_1kb_overlap_genes.csv"
+  )
+)
+write_csv(
+  promoter_1kb_overlap_summary %>%
+    mutate(overlap_group = as.character(overlap_group)),
+  file.path(
+    table_dir,
+    "MtNAC1_MtNAC47_promoter_under_1kb_overlap_summary.csv"
+  )
+)
+
+circle_angle <- seq(0, 2 * pi, length.out = 361)
+promoter_venn_circles <- map_dfr(
+  c("MtNAC1", "MtNAC47"),
+  function(set_name) {
+    center_x <- if (set_name == "MtNAC1") 0.90 else 1.50
+    tibble(
+      set = set_name,
+      point_order = seq_along(circle_angle),
+      x = center_x + 0.72 * cos(circle_angle),
+      y = 1 + 0.72 * sin(circle_angle)
+    )
+  }
+)
+
+promoter_venn_counts <- tibble(
+  overlap_group = c("MtNAC1 only", "Shared", "MtNAC47 only"),
+  gene_count = c(
+    length(promoter_1kb_only_nac1),
+    length(promoter_1kb_shared),
+    length(promoter_1kb_only_nac47)
+  ),
+  x = c(0.55, 1.20, 1.85),
+  y = 1
+)
+
+promoter_venn_set_labels <- tibble(
+  set_label = c(
+    paste0("MtNAC1\n(n = ", length(nac1_promoter_1kb), ")"),
+    paste0("MtNAC47\n(n = ", length(nac47_promoter_1kb), ")")
+  ),
+  x = c(0.55, 1.85),
+  y = 1.86,
+  color = c("#D95F02", "#7570B3")
+)
+
+promoter_1kb_venn_plot <- ggplot() +
+  geom_polygon(
+    data = promoter_venn_circles,
+    aes(x = x, y = y, group = set, fill = set),
+    color = "black",
+    linewidth = 0.5,
+    alpha = 0.42
+  ) +
+  geom_text(
+    data = promoter_venn_counts,
+    aes(x = x, y = y, label = gene_count),
+    size = 5,
+    fontface = "bold"
+  ) +
+  geom_text(
+    data = promoter_venn_set_labels,
+    aes(x = x, y = y, label = set_label, color = color),
+    size = 4,
+    fontface = "bold",
+    lineheight = 0.9,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(
+    values = c(
+      "MtNAC1" = "#D95F02",
+      "MtNAC47" = "#7570B3"
+    ),
+    guide = "none"
+  ) +
+  scale_color_identity() +
+  coord_equal(
+    xlim = c(0.05, 2.35),
+    ylim = c(0.18, 2.08),
+    clip = "off"
+  ) +
+  labs(
+    title = "Overlap of 1 kb promoter targets",
+    subtitle = "Unique genes with a promoter peak <1 kb from the TSS"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    plot.margin = margin(12, 12, 8, 12)
+  )
+
+ggsave(
+  file.path(
+    figure_dir,
+    "MtNAC1_MtNAC47_promoter_under_1kb_venn.png"
+  ),
+  promoter_1kb_venn_plot,
+  width = 6.4,
+  height = 5.4,
+  dpi = 600,
+  bg = "white"
+)
+ggsave(
+  file.path(
+    figure_dir,
+    "MtNAC1_MtNAC47_promoter_under_1kb_venn.pdf"
+  ),
+  promoter_1kb_venn_plot,
+  width = 6.4,
+  height = 5.4,
+  bg = "white"
+)
+
+promoter_1kb_venn_plot
+knitr::kable(
+  promoter_1kb_overlap_summary %>%
+    dplyr::select(
+      `Overlap` = overlap_group,
+      `Genes` = gene_count
+    ),
+  align = c("l", "r"),
+  caption = "Unique 1 kb promoter targets shared by MtNAC1 and MtNAC47"
+)
+```
+
+# Prepare GRN target sets
+
+The unique DAP-seq promoter targets within 1 kb are compared with the target
+genes assigned to the same TF in the shoot consensus GRN top 3% edge list.
+
+```{r compare-promoter-targets-with-grn-top3pct, include=FALSE}
+grn_top3pct_file <- file.path(publication_dir, "inputs", "consensus_network_deg_tf_top3pct_edges.csv")
+if (!file.exists(grn_top3pct_file)) {
+  stop("GRN top 3% edge file is missing: ", grn_top3pct_file)
+}
+
+tf_grn_ids <- tibble(
+  TF = c("NAC1", "NAC11"),
+  TF_label = c("MtNAC1", "MtNAC47"),
+  regulatoryGene = c(
+    "MtrunA17_Chr2g0312321",
+    "MtrunA17_Chr7g0252971"
+  )
+)
+
+grn_top3pct_edges <- read_csv(
+  grn_top3pct_file,
+  show_col_types = FALSE
+)
+
+required_grn_columns <- c("regulatoryGene", "targetGene")
+missing_grn_columns <- setdiff(
+  required_grn_columns,
+  names(grn_top3pct_edges)
+)
+if (length(missing_grn_columns) > 0L) {
+  stop(
+    "Missing required GRN column(s): ",
+    paste(missing_grn_columns, collapse = ", ")
+  )
+}
+
+grn_targets_top3pct <- grn_top3pct_edges %>%
+  transmute(
+    regulatoryGene = normalize_gene_id(regulatoryGene),
+    geneId = normalize_gene_id(targetGene)
+  ) %>%
+  inner_join(tf_grn_ids, by = "regulatoryGene") %>%
+  filter(!is.na(geneId), geneId != "") %>%
+  distinct(TF, TF_label, regulatoryGene, geneId)
+
+missing_grn_tfs <- setdiff(tf_names, unique(grn_targets_top3pct$TF))
+if (length(missing_grn_tfs) > 0L) {
+  stop(
+    "No top 3% GRN targets were found for: ",
+    paste(missing_grn_tfs, collapse = ", ")
+  )
+}
+
+dap_promoter_targets_for_grn <- promoter_targets_under_1kb %>%
+  distinct(TF, geneId) %>%
+  left_join(
+    tf_grn_ids %>%
+      dplyr::select(TF, TF_label, regulatoryGene),
+    by = "TF"
+  )
+
+dap_grn_target_membership <- full_join(
+  dap_promoter_targets_for_grn %>%
+    transmute(
+      TF,
+      TF_label,
+      regulatoryGene,
+      geneId,
+      in_DAPseq_promoter_under_1kb = TRUE
+    ),
+  grn_targets_top3pct %>%
+    transmute(
+      TF,
+      TF_label,
+      regulatoryGene,
+      geneId,
+      in_GRN_top3pct = TRUE
+    ),
+  by = c("TF", "TF_label", "regulatoryGene", "geneId")
+) %>%
+  mutate(
+    in_DAPseq_promoter_under_1kb = coalesce(
+      in_DAPseq_promoter_under_1kb,
+      FALSE
+    ),
+    in_GRN_top3pct = coalesce(in_GRN_top3pct, FALSE),
+    comparison_group = case_when(
+      in_DAPseq_promoter_under_1kb & in_GRN_top3pct ~
+        "Shared DAP-seq and GRN",
+      in_DAPseq_promoter_under_1kb ~ "DAP-seq only",
+      in_GRN_top3pct ~ "GRN only"
+    )
+  ) %>%
+  arrange(match(TF, tf_names), comparison_group, geneId)
+
+dap_grn_overlap_summary <- dap_grn_target_membership %>%
+  group_by(TF, TF_label, regulatoryGene) %>%
+  summarise(
+    DAPseq_promoter_targets_under_1kb =
+      sum(in_DAPseq_promoter_under_1kb),
+    GRN_top3pct_targets = sum(in_GRN_top3pct),
+    shared_targets = sum(
+      in_DAPseq_promoter_under_1kb & in_GRN_top3pct
+    ),
+    union_targets = n(),
+    jaccard_index = shared_targets / union_targets,
+    percent_DAPseq_targets_in_GRN =
+      100 * shared_targets / DAPseq_promoter_targets_under_1kb,
+    percent_GRN_targets_in_DAPseq =
+      100 * shared_targets / GRN_top3pct_targets,
+    .groups = "drop"
+  )
+
+dap_grn_plot_data <- dap_grn_target_membership %>%
+  count(TF, TF_label, comparison_group, name = "gene_count") %>%
+  mutate(
+    TF_label = factor(TF_label, levels = c("MtNAC1", "MtNAC47")),
+    comparison_group = factor(
+      comparison_group,
+      levels = c(
+        "DAP-seq only",
+        "Shared DAP-seq and GRN",
+        "GRN only"
+      )
+    )
+  )
+
+write_csv(
+  grn_targets_top3pct,
+  file.path(
+    table_dir,
+    "MtNAC1_MtNAC47_GRN_top3pct_target_genes.csv"
+  )
+)
+write_csv(
+  dap_grn_target_membership,
+  file.path(
+    table_dir,
+    "DAPseq_promoter_under_1kb_vs_GRN_top3pct_gene_membership.csv"
+  )
+)
+write_csv(
+  dap_grn_overlap_summary,
+  file.path(
+    table_dir,
+    "DAPseq_promoter_under_1kb_vs_GRN_top3pct_overlap_summary.csv"
+  )
+)
+
+```
+# GO enrichment of DAP-seq promoter targets within 1 kb
+
+GO Biological Process enrichment is run separately for MtNAC1 and MtNAC47
+using every unique DAP-seq target gene with a promoter-annotated peak strictly
+less than 1 kb from the transcription start site. The background is the full
+Medicago GO annotation universe. Enrichment uses topGO's classic Fisher test.
+Benjamini–Hochberg correction is applied across every tested term, and terms
+with adjusted p < 0.05 are called significant.
+
+```{r go-enrichment-dapseq-promoter-targets-under-1kb}
+dap_promoter_go_gene_tables <- promoter_targets_under_1kb %>%
+  distinct(TF, geneId) %>%
+  left_join(
+    tf_grn_ids %>% dplyr::select(TF, TF_label),
+    by = "TF"
+  ) %>%
+  group_split(TF, TF_label) %>%
+  set_names(
+    map_chr(
+      .,
+      ~ unique(.x$TF)
+    )
+  )
+
+missing_dap_promoter_go_tfs <- setdiff(
+  tf_names,
+  names(dap_promoter_go_gene_tables)
+)
+if (length(missing_dap_promoter_go_tfs) > 0L) {
+  stop(
+    "No DAP-seq promoter targets under 1 kb were found for: ",
+    paste(missing_dap_promoter_go_tfs, collapse = ", ")
+  )
+}
+
+run_dap_promoter_go <- function(target_table, tf_name) {
+  tf_label <- unique(target_table$TF_label)
+  query_genes <- intersect(
+    unique(target_table$geneId),
+    go_universe
+  )
+
+  if (length(query_genes) == 0L) {
+    stop(
+      "No ",
+      tf_label,
+      " DAP-seq promoter targets occur in the GO universe."
+    )
+  }
+
+  gene_list <- factor(
+    as.integer(go_universe %in% query_genes),
+    levels = c(0, 1)
+  )
+  names(gene_list) <- go_universe
+
+  go_data <- methods::new(
+    "topGOdata",
+    ontology = "BP",
+    allGenes = gene_list,
+    geneSel = function(x) x == "1",
+    annot = topGO::annFUN.GO2genes,
+    GO2genes = GO2genes,
+    nodeSize = 5
+  )
+
+  fisher_result <- topGO::runTest(
+    go_data,
+    algorithm = "classic",
+    statistic = "fisher"
+  )
+
+  result_table <- topGO::GenTable(
+    go_data,
+    Fisher = fisher_result,
+    orderBy = "Fisher",
+    ranksOf = "Fisher",
+    topNodes = length(topGO::score(fisher_result)),
+    numChar = 200
+  ) %>%
+    mutate(
+      TF = tf_name,
+      TF_label = tf_label,
+      promoter_target_gene_count =
+        n_distinct(target_table$geneId),
+      genes_in_go_universe = length(query_genes),
+      Fisher_pvalue = parse_topgo_pvalue(Fisher),
+      padj = p.adjust(Fisher_pvalue, method = "BH"),
+      Significant_num = suppressWarnings(
+        as.numeric(Significant)
+      ),
+      Expected_num = suppressWarnings(
+        as.numeric(Expected)
+      ),
+      FoldEnrichment = if_else(
+        is.finite(Expected_num) & Expected_num > 0,
+        Significant_num / Expected_num,
+        NA_real_
+      )
+    ) %>%
+    relocate(
+      TF,
+      TF_label,
+      promoter_target_gene_count,
+      genes_in_go_universe
+    ) %>%
+    arrange(Fisher_pvalue)
+
+  significant_table <- result_table %>%
+    filter(!is.na(padj), padj < 0.05)
+
+  safe_tf_label <- str_replace_all(
+    tf_label,
+    "[^A-Za-z0-9]+",
+    "_"
+  )
+  write_csv(
+    result_table,
+    file.path(
+      table_dir,
+      paste0(
+        safe_tf_label,
+        "_DAPseq_promoter_under_1kb_topGO_BP.csv"
+      )
+    )
+  )
+  write_csv(
+    significant_table,
+    file.path(
+      table_dir,
+      paste0(
+        safe_tf_label,
+        "_DAPseq_promoter_under_1kb_",
+        "topGO_BP_significant.csv"
+      )
+    )
+  )
+
+  list(
+    GOdata = go_data,
+    test = fisher_result,
+    results = result_table,
+    significant = significant_table,
+    query_genes = query_genes
+  )
+}
+
+dap_promoter_go_results <- imap(
+  dap_promoter_go_gene_tables,
+  ~ run_dap_promoter_go(.x, .y)
+)
+
+all_dap_promoter_go_results <- bind_rows(
+  map(dap_promoter_go_results, "results")
+)
+all_significant_dap_promoter_go_results <- bind_rows(
+  map(dap_promoter_go_results, "significant")
+)
+
+write_csv(
+  all_dap_promoter_go_results,
+  file.path(
+    table_dir,
+    "MtNAC1_MtNAC47_DAPseq_promoter_under_1kb_topGO_BP.csv"
+  )
+)
+write_csv(
+  all_significant_dap_promoter_go_results,
+  file.path(
+    table_dir,
+    paste0(
+      "MtNAC1_MtNAC47_DAPseq_promoter_under_1kb_",
+      "topGO_BP_significant.csv"
+    )
+  )
+)
+saveRDS(
+  dap_promoter_go_results,
+  file.path(
+    output_dir,
+    "MtNAC1_MtNAC47_DAPseq_promoter_under_1kb_topGO_BP_results.rds"
+  )
+)
+
+dap_promoter_go_summary <- tibble(
+  TF = names(dap_promoter_go_results),
+  TF_label = map_chr(
+    dap_promoter_go_results,
+    ~ unique(.x$results$TF_label)
+  ),
+  promoter_targets_in_go_universe = map_int(
+    dap_promoter_go_results,
+    ~ length(.x$query_genes)
+  ),
+  significant_GO_BP_terms = map_int(
+    dap_promoter_go_results,
+    ~ nrow(.x$significant)
+  )
+)
+
+write_csv(
+  dap_promoter_go_summary,
+  file.path(
+    table_dir,
+    "MtNAC1_MtNAC47_DAPseq_promoter_under_1kb_topGO_BP_summary.csv"
+  )
+)
+
+knitr::kable(dap_promoter_go_summary)
+```
+
+## Venn diagrams: DAP-seq versus GRN targets
+
+```{r dap-grn-venn-plots}
+venn_groups <- c(
+  "DAP-seq only",
+  "Shared DAP-seq and GRN",
+  "GRN only"
+)
+
+venn_plot_data <- tibble(
+  TF = rep(tf_names, each = length(venn_groups)),
+  comparison_group = rep(venn_groups, times = length(tf_names))
+) %>%
+  left_join(
+    dap_grn_target_membership %>%
+      count(TF, comparison_group, name = "gene_count"),
+    by = c("TF", "comparison_group")
+  ) %>%
+  left_join(
+    tf_grn_ids %>% dplyr::select(TF, TF_label),
+    by = "TF"
+  ) %>%
+  mutate(
+    gene_count = coalesce(gene_count, 0L),
+    label_x = case_when(
+      comparison_group == "DAP-seq only" ~ 0.55,
+      comparison_group == "Shared DAP-seq and GRN" ~ 1.20,
+      comparison_group == "GRN only" ~ 1.85
+    ),
+    label_y = 1
+  )
+
+circle_angle <- seq(0, 2 * pi, length.out = 361)
+venn_circle_data <- map_dfr(
+  seq_len(nrow(tf_grn_ids)),
+  function(i) {
+    current_tf <- tf_grn_ids[i, ]
+    map_dfr(
+      c("DAP-seq promoter <1 kb", "GRN top 3%"),
+      function(set_name) {
+        center_x <- if (
+          set_name == "DAP-seq promoter <1 kb"
+        ) 0.90 else 1.50
+
+        tibble(
+          TF_label = current_tf$TF_label,
+          set = set_name,
+          point_order = seq_along(circle_angle),
+          x = center_x + 0.72 * cos(circle_angle),
+          y = 1 + 0.72 * sin(circle_angle)
+        )
+      }
+    )
+  }
+)
+
+venn_set_labels <- map_dfr(
+  tf_grn_ids$TF_label,
+  ~ tibble(
+    TF_label = .x,
+    set_label = c("DAP-seq\npromoter <1 kb", "GRN\ntop 3%"),
+    x = c(0.55, 1.85),
+    y = c(1.82, 1.82)
+  )
+)
+
+dap_grn_venn_plot <- ggplot() +
+  geom_polygon(
+    data = venn_circle_data,
+    aes(
+      x = x,
+      y = y,
+      group = interaction(TF_label, set),
+      fill = set
+    ),
+    color = "black",
+    linewidth = 0.5,
+    alpha = 0.42
+  ) +
+  geom_text(
+    data = venn_plot_data,
+    aes(x = label_x, y = label_y, label = gene_count),
+    size = 5,
+    fontface = "bold"
+  ) +
+  geom_text(
+    data = venn_set_labels,
+    aes(x = x, y = y, label = set_label),
+    size = 3.6,
+    fontface = "bold",
+    lineheight = 0.9
+  ) +
+  facet_wrap(~ TF_label) +
+  scale_fill_manual(
+    values = c(
+      "DAP-seq promoter <1 kb" = "#2C7FB8",
+      "GRN top 3%" = "#BDBDBD"
+    ),
+    guide = "none"
+  ) +
+  coord_equal(
+    xlim = c(0.08, 2.32),
+    ylim = c(0.18, 2.02),
+    clip = "off"
+  ) +
+  labs(
+    title = "DAP-seq promoter targets versus shoot GRN targets",
+    subtitle = "Numbers represent unique genes"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold", size = 13),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+ggsave(
+  file.path(
+    figure_dir,
+    "DAPseq_promoter_under_1kb_vs_GRN_top3pct_venn.png"
+  ),
+  dap_grn_venn_plot,
+  width = 9,
+  height = 5,
+  dpi = 600,
+  bg = "white"
+)
+ggsave(
+  file.path(
+    figure_dir,
+    "DAPseq_promoter_under_1kb_vs_GRN_top3pct_venn.pdf"
+  ),
+  dap_grn_venn_plot,
+  width = 9,
+  height = 5,
+  bg = "white"
+)
+
+dap_grn_venn_plot
+```
+
+## Annotated DAP-seq and GRN intersection
+
+The exported table contains every gene shared by the DAP-seq promoter target
+set under 1 kb and the shoot consensus GRN top 3% target set. It includes
+curated gene names and products, DAP-seq promoter-peak evidence, and GRN
+ranking metrics. Transient-expression results are not included.
+
+```{r annotate-dapseq-grn-intersection, include=FALSE}
+
+annotation_summary_file <- file.path(publication_dir, "inputs", "annotation", "MtrunA17r5.0-ANR-EGN-r1.9.summary.tsv")
+curated_gene_names_file <- file.path(publication_dir, "inputs", "annotation", "MtrunA17r5.0-ANR-EGN-r1.9.gene_names.tsv")
+
+missing_annotation_files <- c(
+  annotation_summary_file,
+  curated_gene_names_file
+)
+missing_annotation_files <- missing_annotation_files[
+  !file.exists(missing_annotation_files)
+]
+if (length(missing_annotation_files) > 0L) {
+  stop(
+    "Missing gene annotation file(s): ",
+    paste(missing_annotation_files, collapse = ", ")
+  )
+}
+
+summary_gene_annotation <- read_tsv(
+  annotation_summary_file,
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE
+) %>%
+  transmute(
+    geneId = normalize_gene_id(LOCUS_TAG),
+    summary_gene_name = na_if(GN, ""),
+    summary_gene_product = na_if(PRODUCT, "")
+  ) %>%
+  distinct(geneId, .keep_all = TRUE)
+
+curated_gene_annotation <- read_tsv(
+  curated_gene_names_file,
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE
+) %>%
+  transmute(
+    geneId = normalize_gene_id(locus_tag),
+    curated_gene_name = na_if(acronym, ""),
+    curated_gene_product = na_if(geneProduct, "")
+  ) %>%
+  distinct(geneId, .keep_all = TRUE)
+
+intersection_gene_annotation <- full_join(
+  summary_gene_annotation,
+  curated_gene_annotation,
+  by = "geneId"
+) %>%
+  transmute(
+    geneId,
+    GeneName = coalesce(
+      curated_gene_name,
+      summary_gene_name,
+      ""
+    ),
+    GeneProduct = coalesce(
+      summary_gene_product,
+      curated_gene_product,
+      ""
+    )
+  )
+
+intersection_dap_evidence <- dapseq_all %>%
+  filter(
+    str_detect(
+      as.character(annotation),
+      regex("^Promoter", ignore_case = TRUE)
+    ),
+    !is.na(distanceToTSS),
+    abs(as.numeric(distanceToTSS)) < 1000,
+    !is.na(geneId),
+    geneId != ""
+  ) %>%
+  group_by(TF, geneId) %>%
+  summarise(
+    DAPseq_promoter_peak_count_under_1kb = n(),
+    DAPseq_closest_peak_distance_to_TSS = distanceToTSS[
+      which.min(abs(distanceToTSS))
+    ],
+    DAPseq_minimum_absolute_distance_to_TSS =
+      min(abs(distanceToTSS)),
+    .groups = "drop"
+  )
+
+required_grn_annotation_columns <- c(
+  "regulatoryGene",
+  "targetGene",
+  "CLR_Rank",
+  "genie3_Rank",
+  "aracne_Rank",
+  "outpredict_Rank",
+  "GeoMeanRank"
+)
+missing_grn_annotation_columns <- setdiff(
+  required_grn_annotation_columns,
+  names(grn_top3pct_edges)
+)
+if (length(missing_grn_annotation_columns) > 0L) {
+  stop(
+    "Missing GRN annotation column(s): ",
+    paste(missing_grn_annotation_columns, collapse = ", ")
+  )
+}
+
+intersection_grn_evidence <- grn_top3pct_edges %>%
+  transmute(
+    regulatoryGene = normalize_gene_id(regulatoryGene),
+    geneId = normalize_gene_id(targetGene),
+    CLR_Rank = as.numeric(CLR_Rank),
+    genie3_Rank = as.numeric(genie3_Rank),
+    aracne_Rank = as.numeric(aracne_Rank),
+    outpredict_Rank = as.numeric(outpredict_Rank),
+    GeoMeanRank = as.numeric(GeoMeanRank)
+  ) %>%
+  inner_join(
+    tf_grn_ids %>%
+      dplyr::select(TF, regulatoryGene),
+    by = "regulatoryGene"
+  ) %>%
+  group_by(TF, regulatoryGene, geneId) %>%
+  dplyr::slice_min(GeoMeanRank, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+annotated_dap_grn_intersection <- dap_grn_target_membership %>%
+  filter(in_DAPseq_promoter_under_1kb, in_GRN_top3pct) %>%
+  dplyr::select(TF, TF_label, regulatoryGene, geneId) %>%
+  distinct() %>%
+  left_join(
+    intersection_gene_annotation,
+    by = "geneId"
+  ) %>%
+  left_join(
+    intersection_dap_evidence,
+    by = c("TF", "geneId")
+  ) %>%
+  left_join(
+    intersection_grn_evidence,
+    by = c("TF", "regulatoryGene", "geneId")
+  ) %>%
+  mutate(
+    GeneName = coalesce(GeneName, ""),
+    GeneProduct = coalesce(GeneProduct, "")
+  ) %>%
+  relocate(
+    GeneName,
+    GeneProduct,
+    .after = geneId
+  ) %>%
+  arrange(
+    match(TF, tf_names),
+    geneId
+  )
+
+write_csv(
+  annotated_dap_grn_intersection,
+  file.path(
+    table_dir,
+    "DAPseq_GRN_intersection_annotated.csv"
+  )
+)
+
+intersection_annotation_summary <- annotated_dap_grn_intersection %>%
+  count(TF, TF_label, name = "annotated_intersection_genes")
+
+knitr::kable(intersection_annotation_summary)
+```
+
+# Co-expression direction of GRN targets
+
+Co-expression direction is estimated only for MtNAC1 and MtNAC47. For every
+target assigned to these TFs in the top 3% GRN, Pearson correlation is
+calculated between TF and target expression across the VST-transformed shoot
+RNA-seq samples. P values are adjusted separately for each TF across all of its
+tested GRN targets before the DAP-seq/GRN intersection is selected.
+
+Positive and negative labels indicate co-expression direction; they do not by
+themselves prove direct activation or repression.
+
+```{r infer-grn-target-coexpression-direction}
+shoot_wgcna_rds <- file.path(publication_dir, "inputs", "ShootWGCNA_objects.rds")
+if (!file.exists(shoot_wgcna_rds)) {
+  stop("Shoot WGCNA object is missing: ", shoot_wgcna_rds)
+}
+
+shoot_wgcna_object <- readRDS(shoot_wgcna_rds)
+shoot_expression <- shoot_wgcna_object$datExpr
+
+if (
+  !is.matrix(shoot_expression) &&
+    !is.data.frame(shoot_expression)
+) {
+  stop("The Shoot WGCNA object does not contain a valid datExpr matrix.")
+}
+
+shoot_expression <- as.matrix(shoot_expression)
+colnames(shoot_expression) <- normalize_gene_id(
+  colnames(shoot_expression)
+)
+
+if (anyDuplicated(colnames(shoot_expression)) > 0L) {
+  stop("Gene ID normalization produced duplicate expression columns.")
+}
+
+requested_tf_ids <- tf_grn_ids %>%
+  filter(TF %in% c("NAC1", "NAC11"))
+
+missing_expression_tfs <- requested_tf_ids$regulatoryGene[
+  !requested_tf_ids$regulatoryGene %in% colnames(shoot_expression)
+]
+if (length(missing_expression_tfs) > 0L) {
+  stop(
+    "TF gene(s) missing from the shoot expression matrix: ",
+    paste(missing_expression_tfs, collapse = ", ")
+  )
+}
+
+grn_edges_for_direction <- grn_targets_top3pct %>%
+  semi_join(
+    requested_tf_ids,
+    by = c("TF", "TF_label", "regulatoryGene")
+  ) %>%
+  distinct(TF, TF_label, regulatoryGene, geneId)
+
+correlate_tf_target <- function(
+  TF,
+  TF_label,
+  regulatoryGene,
+  geneId
+) {
+  if (!geneId %in% colnames(shoot_expression)) {
+    return(
+      tibble(
+        TF = TF,
+        TF_label = TF_label,
+        regulatoryGene = regulatoryGene,
+        geneId = geneId,
+        n_samples = NA_integer_,
+        expression_correlation = NA_real_,
+        correlation_pvalue = NA_real_
+      )
+    )
+  }
+
+  tf_expression <- as.numeric(
+    shoot_expression[, regulatoryGene]
+  )
+  target_expression <- as.numeric(
+    shoot_expression[, geneId]
+  )
+  complete_samples <- complete.cases(
+    tf_expression,
+    target_expression
+  )
+  sample_count <- sum(complete_samples)
+
+  if (
+    sample_count < 3L ||
+      stats::sd(tf_expression[complete_samples]) == 0 ||
+      stats::sd(target_expression[complete_samples]) == 0
+  ) {
+    return(
+      tibble(
+        TF = TF,
+        TF_label = TF_label,
+        regulatoryGene = regulatoryGene,
+        geneId = geneId,
+        n_samples = sample_count,
+        expression_correlation = NA_real_,
+        correlation_pvalue = NA_real_
+      )
+    )
+  }
+
+  correlation_test <- stats::cor.test(
+    tf_expression[complete_samples],
+    target_expression[complete_samples],
+    method = "pearson"
+  )
+
+  tibble(
+    TF = TF,
+    TF_label = TF_label,
+    regulatoryGene = regulatoryGene,
+    geneId = geneId,
+    n_samples = sample_count,
+    expression_correlation = unname(correlation_test$estimate),
+    correlation_pvalue = correlation_test$p.value
+  )
+}
+
+grn_target_directions <- pmap_dfr(
+  grn_edges_for_direction,
+  correlate_tf_target
+) %>%
+  group_by(TF) %>%
+  mutate(
+    correlation_padj = p.adjust(
+      correlation_pvalue,
+      method = "BH"
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    coexpression_direction = case_when(
+      !is.na(correlation_padj) &
+        correlation_padj < 0.05 &
+        expression_correlation > 0 ~ "Positive co-expression",
+      !is.na(correlation_padj) &
+        correlation_padj < 0.05 &
+        expression_correlation < 0 ~ "Negative co-expression",
+      TRUE ~ "Undetermined"
+    )
+  ) %>%
+  arrange(
+    match(TF, tf_names),
+    correlation_padj,
+    desc(abs(expression_correlation))
+  )
+
+write_csv(
+  grn_target_directions,
+  file.path(
+    table_dir,
+    "MtNAC1_MtNAC47_GRN_top3pct_coexpression_direction.csv"
+  )
+)
+
+annotated_intersection_with_direction <-
+  annotated_dap_grn_intersection %>%
+  left_join(
+    grn_target_directions %>%
+      dplyr::select(
+        TF,
+        regulatoryGene,
+        geneId,
+        n_samples,
+        expression_correlation,
+        correlation_pvalue,
+        correlation_padj,
+        coexpression_direction
+      ),
+    by = c("TF", "regulatoryGene", "geneId")
+  ) %>%
+  arrange(
+    match(TF, tf_names),
+    factor(
+      coexpression_direction,
+      levels = c(
+        "Positive co-expression",
+        "Negative co-expression",
+        "Undetermined"
+      )
+    ),
+    correlation_padj,
+    geneId
+  )
+
+write_csv(
+  annotated_intersection_with_direction,
+  file.path(
+    table_dir,
+    paste0(
+      "DAPseq_GRN_intersection_annotated_",
+      "with_coexpression_direction.csv"
+    )
+  )
+)
+
+direction_levels <- c(
+  "Positive co-expression",
+  "Negative co-expression",
+  "Undetermined"
+)
+
+intersection_direction_summary <- tibble(
+  TF = rep(tf_names, each = length(direction_levels)),
+  coexpression_direction = rep(
+    direction_levels,
+    times = length(tf_names)
+  )
+) %>%
+  left_join(
+    annotated_intersection_with_direction %>%
+      count(
+        TF,
+        coexpression_direction,
+        name = "target_gene_count"
+      ),
+    by = c("TF", "coexpression_direction")
+  ) %>%
+  left_join(
+    requested_tf_ids %>%
+      dplyr::select(TF, TF_label),
+    by = "TF"
+  ) %>%
+  mutate(
+    target_gene_count = coalesce(target_gene_count, 0L)
+  ) %>%
+  group_by(TF, TF_label) %>%
+  mutate(
+    total_intersection_genes = sum(target_gene_count),
+    percentage = 100 *
+      target_gene_count / total_intersection_genes
+  ) %>%
+  ungroup() %>%
+  mutate(
+    TF_label = factor(
+      TF_label,
+      levels = c("MtNAC1", "MtNAC47")
+    ),
+    coexpression_direction = factor(
+      coexpression_direction,
+      levels = direction_levels
+    )
+  )
+
+write_csv(
+  intersection_direction_summary %>%
+    mutate(
+      TF_label = as.character(TF_label),
+      coexpression_direction = as.character(
+        coexpression_direction
+      )
+    ),
+  file.path(
+    table_dir,
+    "DAPseq_GRN_intersection_coexpression_direction_summary.csv"
+  )
+)
+
+make_intersection_direction_plot <- function(tf_name) {
+  plot_data <- intersection_direction_summary %>%
+    filter(
+      TF == tf_name,
+      coexpression_direction %in% c(
+        "Positive co-expression",
+        "Negative co-expression"
+      )
+    ) %>%
+    droplevels()
+
+  tf_label <- unique(as.character(plot_data$TF_label))
+
+  ggplot(
+    plot_data,
+    aes(
+      x = coexpression_direction,
+      y = target_gene_count,
+      fill = coexpression_direction
+    )
+  ) +
+    geom_col(
+      width = 0.62,
+      color = "black",
+      linewidth = 0.35
+    ) +
+    geom_text(
+      aes(
+        label = ifelse(
+          target_gene_count > 0,
+          paste0(
+            target_gene_count,
+            "\n(",
+            sprintf("%.1f", percentage),
+            "%)"
+          ),
+          ""
+        )
+      ),
+      vjust = -0.45,
+      size = 3.9,
+      lineheight = 0.9
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Positive co-expression" = "#D73027",
+        "Negative co-expression" = "#4575B4",
+        "Undetermined" = "#BDBDBD"
+      ),
+      guide = "none"
+    ) +
+    scale_x_discrete(
+      labels = c(
+        "Positive co-expression" = "Positive",
+        "Negative co-expression" = "Negative"
+      )
+    ) +
+    scale_y_continuous(
+      breaks = scales::breaks_pretty(),
+      expand = expansion(mult = c(0, 0.16))
+    ) +
+    labs(
+      title = tf_label,
+      subtitle = paste(
+        "Pearson correlation; BH-adjusted P < 0.05;",
+        "percentages use all intersection genes"
+      ),
+      x = NULL,
+      y = "Target genes"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x = element_text(face = "bold"),
+      plot.title = element_text(
+        face = "bold",
+        hjust = 0.5
+      ),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+}
+
+intersection_direction_plots <- setNames(
+  map(tf_names, make_intersection_direction_plot),
+  c("MtNAC1", "MtNAC47")
+)
+
+iwalk(
+  intersection_direction_plots,
+  function(plot_object, tf_label) {
+    file_stem <- paste0(
+      "DAPseq_GRN_intersection_coexpression_direction_",
+      tf_label
+    )
+
+    ggsave(
+      file.path(figure_dir, paste0(file_stem, ".png")),
+      plot_object,
+      width = 5.8,
+      height = 5.5,
+      dpi = 600,
+      bg = "white"
+    )
+    ggsave(
+      file.path(figure_dir, paste0(file_stem, ".pdf")),
+      plot_object,
+      width = 5.8,
+      height = 5.5,
+      bg = "white"
+    )
+
+    print(plot_object)
+  }
+)
+
+knitr::kable(
+  intersection_direction_summary %>%
+    mutate(
+      TF_label = as.character(TF_label),
+      coexpression_direction = as.character(
+        coexpression_direction
+      )
+    ),
+  digits = 1
+)
+```
+
+
+

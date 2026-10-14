@@ -1,0 +1,863 @@
+---
+title: "NAC47 overexpression: differential expression and GO enrichment"
+author: "Yuchen Wang"
+date: "2026-10-14"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(here)
+here::i_am("Script/script_for_publication/Section08_NAC47Overexpression.rmd")
+project_library <- here(".r-library", paste(R.version$major,
+  strsplit(R.version$minor, "\\.")[[1]][1], sep = "."))
+if (dir.exists(project_library)) .libPaths(c(project_library, .libPaths()))
+```
+
+# Load packages
+
+```{r load-packages}
+library(DESeq2)
+library(SummarizedExperiment)
+library(ggplot2)
+library(readr)
+library(dplyr)
+library(tibble)
+# Register the legacy ExpData union only if dataset construction requires it.
+# Pre-registering it can disrupt S4 initialization on newer Bioconductor stacks.
+```
+
+# Load count data and sample metadata
+
+NAC11 is the historical construct label for NAC47. The publication count file
+is an unchanged copy of the unfiltered NAC11-versus-empty matrix exported by
+`MT_transient.rmd`, with four overexpression samples and four controls.
+The copied metadata retains the original labels for traceability; NAC11 is
+renamed to NAC47 in this analysis.
+
+```{r load-data}
+counts_raw <- read.delim(here("Data", "data_for_publication",
+  "MtNAC47_vs_Empty_raw_counts.tsv"), check.names = FALSE, stringsAsFactors = FALSE)
+sample_metadata <- read.csv(here("Data", "data_for_publication",
+  "MtNAC47_vs_Empty_metadata.csv"), stringsAsFactors = FALSE)
+stopifnot(all(c("RNAseqID", "Construct", "Replicate", "LeafNode") %in%
+                names(sample_metadata)), "Geneid" %in% names(counts_raw),
+          !anyDuplicated(sample_metadata$RNAseqID), !anyDuplicated(counts_raw$Geneid),
+          setequal(sample_metadata$RNAseqID, names(counts_raw)[-1]),
+          all(sample_metadata$Construct %in% c("MtNAC11", "Empty")),
+          sum(sample_metadata$Construct == "MtNAC11") == 4,
+          sum(sample_metadata$Construct == "Empty") == 4)
+counts_mat <- as.matrix(counts_raw[, sample_metadata$RNAseqID, drop = FALSE])
+stopifnot(is.numeric(counts_mat), all(is.finite(counts_mat)),
+          all(counts_mat >= 0), all(counts_mat == round(counts_mat)))
+storage.mode(counts_mat) <- "integer"
+dimnames(counts_mat) <- list(unname(as.character(counts_raw$Geneid)),
+                            unname(as.character(colnames(counts_mat))))
+attr(counts_mat, "names") <- NULL
+rownames(sample_metadata) <- unname(as.character(sample_metadata$RNAseqID))
+sample_metadata$Construct[sample_metadata$Construct == "MtNAC11"] <- "MtNAC47"
+stopifnot(identical(colnames(counts_mat), rownames(sample_metadata)))
+print(table(sample_metadata$Construct))
+```
+
+# Differential-expression settings and annotation
+
+DEGs require adjusted P value below 0.05, with no additional fold-change
+threshold, matching the executable settings in `MT_transient.rmd`.
+Positive log2 fold changes indicate higher expression under NAC47 overexpression.
+Outputs are saved under `Data/data_for_publication/NAC47_overexpression`.
+
+```{r differential-expression-settings}
+alpha_cutoff <- 0.05
+lfc_cutoff <- 0
+pairwise_dir <- here("Data", "data_for_publication", "NAC47_overexpression")
+dir.create(pairwise_dir, recursive = TRUE, showWarnings = FALSE)
+annotation_summary <- read_tsv(here("MT_genome", "annotation",
+  "MtrunA17r5.0-ANR-EGN-r1.9.summary.tsv"),
+  col_types = cols(.default = col_character()), show_col_types = FALSE)
+gene_annotation <- annotation_summary %>%
+  transmute(Geneid = LOCUS_TAG, GeneName = case_when(
+    !is.na(GN) & trimws(GN) != "" ~ GN,
+    !is.na(PRODUCT) & trimws(PRODUCT) != "" ~ PRODUCT,
+    TRUE ~ "")) %>% distinct(Geneid, .keep_all = TRUE)
+pairwise_counts <- list(MtNAC47 = counts_mat)
+pairwise_metadata <- list(MtNAC47 = sample_metadata)
+```
+
+# Prepare the NAC47 DESeq2 dataset
+
+The NAC47 model contains eight samples and uses
+`~ Replicate + LeafNode + Construct` to adjust for replicate and leaf node
+before estimating the construct effect. Low-count genes are prefiltered
+independently by requiring at least 10 counts in at least four of the eight
+samples.
+
+```{r prepare-nac47-dataset}
+pairwise_result_dir <- file.path(pairwise_dir, "DESeq_results")
+dir.create(pairwise_result_dir, recursive = TRUE, showWarnings = FALSE)
+
+pairwise_deseq_results <- list()
+pairwise_summary <- list()
+
+tf_name <- "MtNAC47"
+  pair_counts <- pairwise_counts[[tf_name]]
+  pair_metadata <- pairwise_metadata[[tf_name]]
+
+  pair_keep <- unname(rowSums(pair_counts >= 10) >= 4)
+  pair_counts_filtered <- pair_counts[pair_keep, , drop = FALSE]
+  dimnames(pair_counts_filtered) <- list(
+    unname(as.character(rownames(pair_counts_filtered))),
+    unname(as.character(colnames(pair_counts_filtered))))
+  attr(pair_counts_filtered, "names") <- NULL
+  pair_metadata <- as.data.frame(pair_metadata)
+  rownames(pair_metadata) <- unname(colnames(pair_counts_filtered))
+
+  pair_metadata$Construct <- relevel(
+    factor(pair_metadata$Construct),
+    ref = "Empty"
+  )
+  pair_metadata$Replicate <- factor(pair_metadata$Replicate)
+  pair_metadata$LeafNode <- factor(pair_metadata$LeafNode)
+
+  model_matrix <- model.matrix(~ Replicate + LeafNode + Construct, pair_metadata)
+  stopifnot(qr(model_matrix)$rank == ncol(model_matrix),
+            nrow(model_matrix) > ncol(model_matrix), nrow(pair_counts_filtered) > 0)
+
+  make_pair_dds <- function() {
+    DESeqDataSetFromMatrix(
+      countData = pair_counts_filtered,
+      colData = pair_metadata,
+      design = ~ Replicate + LeafNode + Construct
+    )
+  }
+  pair_dds <- tryCatch(make_pair_dds(), error = function(e) {
+    if (grepl("ExpData", conditionMessage(e), fixed = TRUE) &&
+        !methods::isClass("ExpData")) {
+      methods::setClassUnion("ExpData", c("matrix", "SummarizedExperiment"))
+      make_pair_dds()
+    } else {
+      stop(e)
+    }
+  })
+```
+
+# PCA of NAC47 overexpression and empty-vector samples
+
+A blind variance-stabilizing transformation shows the variation among the eight
+samples before testing the NAC47 construct effect. Points are colored by replicate
+and shaped by construct.
+
+```{r nac47-pca, fig.width=8, fig.height=6}
+  vsd_qc <- varianceStabilizingTransformation(pair_dds, blind = TRUE)
+  pca_data <- plotPCA(vsd_qc, intgroup = c("Construct", "Replicate", "LeafNode"),
+                      returnData = TRUE)
+  percent_variance <- round(100 * attr(pca_data, "percentVar"))
+  pca_plot <- ggplot(pca_data, aes(PC1, PC2, color = Replicate, shape = Construct)) +
+    geom_point(size = 3) +
+    geom_text(aes(label = name), vjust = -0.8, size = 3, check_overlap = TRUE) +
+    labs(title = "NAC47 versus Empty: PCA",
+         x = paste0("PC1: ", percent_variance[1], "% variance"),
+         y = paste0("PC2: ", percent_variance[2], "% variance")) + theme_bw()
+  print(pca_plot)
+  ggsave(file.path(pairwise_result_dir, "MtNAC47_vs_Empty_PCA.pdf"),
+         pca_plot, width = 8, height = 6)
+```
+
+# Identify NAC47 overexpression DEGs
+
+After examining sample variation in the PCA, fit the model to estimate the NAC47
+versus empty-vector effect while adjusting for replicate and leaf node. Significant
+genes are separated by the direction of their log2 fold change and summarized in
+the volcano plot below.
+
+```{r nac47-deseq2}
+  pair_dds <- DESeq(pair_dds)
+  write_csv(as.data.frame(counts(pair_dds, normalized = TRUE)) %>%
+              rownames_to_column("Geneid"),
+            file.path(pairwise_result_dir, "MtNAC47_vs_Empty_normalized_counts.csv"))
+
+  pair_result <- results(
+    pair_dds,
+    contrast = c("Construct", tf_name, "Empty"),
+    alpha = alpha_cutoff
+  )
+
+  pair_result_table <- as.data.frame(pair_result) %>%
+    rownames_to_column("Geneid") %>%
+    dplyr::left_join(gene_annotation, by = "Geneid") %>%
+    dplyr::mutate(GeneName = dplyr::coalesce(GeneName, "")) %>%
+    dplyr::relocate(GeneName, .after = Geneid) %>%
+    dplyr::arrange(padj)
+
+  pair_deg_table <- pair_result_table %>%
+    dplyr::filter(
+      !is.na(padj),
+      padj < alpha_cutoff,
+      abs(log2FoldChange) >= lfc_cutoff
+    ) %>%
+    dplyr::mutate(
+      Regulation = dplyr::case_when(
+        log2FoldChange > 0 ~ "Upregulated",
+        log2FoldChange < 0 ~ "Downregulated",
+        TRUE ~ "Unchanged"
+      )
+    ) %>%
+    dplyr::select(
+      Geneid, GeneName, Regulation, log2FoldChange, padj
+    )
+
+  pair_upregulated <- pair_deg_table %>%
+    dplyr::filter(Regulation == "Upregulated")
+  pair_downregulated <- pair_deg_table %>%
+    dplyr::filter(Regulation == "Downregulated")
+
+  write_csv(
+    pair_result_table,
+    file.path(
+      pairwise_result_dir,
+      paste0(tf_name, "_vs_Empty_all_results.csv")
+    )
+  )
+  write_csv(
+    pair_deg_table,
+    file.path(
+      pairwise_result_dir,
+      paste0(tf_name, "_vs_Empty_DEGs.csv")
+    )
+  )
+  write_csv(
+    pair_upregulated,
+    file.path(
+      pairwise_result_dir,
+      paste0(tf_name, "_vs_Empty_upregulated_DEGs.csv")
+    )
+  )
+  write_csv(
+    pair_downregulated,
+    file.path(
+      pairwise_result_dir,
+      paste0(tf_name, "_vs_Empty_downregulated_DEGs.csv")
+    )
+  )
+  saveRDS(
+    pair_dds,
+    file.path(pairwise_result_dir, paste0(tf_name, "_vs_Empty_dds.rds"))
+  )
+
+  pairwise_deseq_results[[tf_name]] <- list(
+    dds = pair_dds,
+    all = pair_result_table,
+    deg = pair_deg_table,
+    upregulated = pair_upregulated,
+    downregulated = pair_downregulated
+  )
+  pairwise_summary[[tf_name]] <- data.frame(
+    TF = tf_name,
+    Samples = ncol(pair_dds),
+    Genes_tested = nrow(pair_dds),
+    DEGs = nrow(pair_deg_table),
+    Upregulated = nrow(pair_upregulated),
+    Downregulated = nrow(pair_downregulated)
+  )
+
+  cat(
+    tf_name, "vs Empty: ", nrow(pair_deg_table), " DEGs (",
+    nrow(pair_upregulated), " upregulated; ",
+    nrow(pair_downregulated), " downregulated)\n",
+    sep = ""
+  )
+
+pairwise_summary_table <- dplyr::bind_rows(pairwise_summary)
+write_csv(
+  pairwise_summary_table,
+  file.path(pairwise_result_dir, "pairwise_DESeq_summary.csv")
+)
+
+all_pairwise_classified_degs <- dplyr::bind_rows(lapply(
+  names(pairwise_deseq_results),
+  function(tf_name) {
+    pairwise_deseq_results[[tf_name]]$deg %>%
+      dplyr::mutate(TF = tf_name, .before = 1)
+  }
+))
+write_csv(
+  all_pairwise_classified_degs,
+  file.path(pairwise_result_dir, "all_pairwise_classified_DEGs.csv")
+)
+
+saveRDS(
+  pairwise_deseq_results,
+  file.path(pairwise_result_dir, "all_pairwise_DESeq_results.rds")
+)
+
+pairwise_summary_table
+```
+
+```{r mtnac47-figure-setup, include=FALSE}
+if (!requireNamespace("ggrepel", quietly = TRUE) ||
+    !requireNamespace("stringr", quietly = TRUE)) {
+  stop("ggrepel and stringr are required for the appended NAC47 figures.")
+}
+table_dir <- file.path(pairwise_dir, "tables")
+figure_dir <- file.path(pairwise_dir, "figures")
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+normalize_gene_id <- function(x) {
+  x <- trimws(as.character(x))
+  sub("^MtrunA17(?=(Chr|CP|MT))", "MtrunA17_", x, perl = TRUE)
+}
+```
+
+```{r load-mtnac47-transient-degs, include=FALSE}
+mtnac47_deg_file <- file.path(pairwise_result_dir, "MtNAC47_vs_Empty_DEGs.csv")
+mtnac47_all_results_file <- file.path(pairwise_result_dir, "MtNAC47_vs_Empty_all_results.csv")
+
+missing_mtnac47_transient_files <- c(
+  mtnac47_deg_file,
+  mtnac47_all_results_file
+)
+missing_mtnac47_transient_files <-
+  missing_mtnac47_transient_files[
+    !file.exists(missing_mtnac47_transient_files)
+  ]
+if (length(missing_mtnac47_transient_files) > 0L) {
+  stop(
+    "Missing MtNAC47 transient file(s): ",
+    paste(missing_mtnac47_transient_files, collapse = ", ")
+  )
+}
+
+mtnac47_degs <- read_csv(
+  mtnac47_deg_file,
+  show_col_types = FALSE
+)
+
+required_mtnac47_deg_columns <- c(
+  "Geneid",
+  "GeneName",
+  "Regulation",
+  "log2FoldChange",
+  "padj"
+)
+missing_mtnac47_deg_columns <- setdiff(
+  required_mtnac47_deg_columns,
+  names(mtnac47_degs)
+)
+if (length(missing_mtnac47_deg_columns) > 0L) {
+  stop(
+    "Missing required MtNAC47 DEG column(s): ",
+    paste(missing_mtnac47_deg_columns, collapse = ", ")
+  )
+}
+
+mtnac47_degs <- mtnac47_degs %>%
+  transmute(
+    TF = "MtNAC47",
+    geneId = normalize_gene_id(Geneid),
+    GeneName = as.character(GeneName),
+    Regulation = as.character(Regulation),
+    log2FoldChange = as.numeric(log2FoldChange),
+    padj = as.numeric(padj)
+  ) %>%
+  filter(
+    !is.na(geneId),
+    geneId != "",
+    Regulation %in% c("Upregulated", "Downregulated")
+  ) %>%
+  distinct(geneId, .keep_all = TRUE) %>%
+  arrange(Regulation, padj)
+
+mtnac47_upregulated_genes <- mtnac47_degs %>%
+  filter(Regulation == "Upregulated")
+
+mtnac47_all_results <- read_csv(
+  mtnac47_all_results_file,
+  show_col_types = FALSE
+)
+if (!"Geneid" %in% names(mtnac47_all_results)) {
+  stop(
+    "Geneid is missing from the complete MtNAC47 result file: ",
+    mtnac47_all_results_file
+  )
+}
+
+mtnac47_tested_genes <- mtnac47_all_results %>%
+  transmute(geneId = normalize_gene_id(Geneid)) %>%
+  filter(!is.na(geneId), geneId != "") %>%
+  distinct(geneId) %>%
+  pull(geneId)
+
+write_csv(
+  mtnac47_degs,
+  file.path(
+    table_dir,
+    "MtNAC47_transient_DEGs.csv"
+  )
+)
+write_csv(
+  mtnac47_upregulated_genes,
+  file.path(
+    table_dir,
+    "MtNAC47_transient_upregulated_genes.csv"
+  )
+)
+```
+
+# Volcano plot of NAC47 overexpression DEGs
+
+Significant genes use the same rule as the DEG table: adjusted p < 0.05.
+Upregulated genes have a positive log2 fold change and downregulated genes
+have a negative log2 fold change. Labels mark the flavonoid, cell-wall,
+jasmonate, and defense genes selected from the log2 fold change > 4 set.
+
+```{r mtnac47-transient-deg-direction-figure}
+mtnac47_volcano_data <- mtnac47_all_results %>%
+  transmute(
+    geneId = normalize_gene_id(Geneid),
+    GeneName = as.character(GeneName),
+    log2FoldChange = as.numeric(log2FoldChange),
+    padj = as.numeric(padj)
+  ) %>%
+  filter(
+    !is.na(geneId),
+    geneId != "",
+    !is.na(log2FoldChange),
+    is.finite(log2FoldChange)
+  ) %>%
+  distinct(geneId, .keep_all = TRUE) %>%
+  mutate(
+    neg_log10_padj = -log10(pmax(padj, .Machine$double.xmin)),
+    plot_neg_log10_padj = pmin(neg_log10_padj, 20),
+    Regulation = case_when(
+      !is.na(padj) & padj < 0.05 & log2FoldChange > 0 ~ "Upregulated",
+      !is.na(padj) & padj < 0.05 & log2FoldChange < 0 ~ "Downregulated",
+      TRUE ~ "Not significant"
+    ),
+    Regulation = factor(
+      Regulation,
+      levels = c("Not significant", "Downregulated", "Upregulated")
+    ),
+    volcano_label = dplyr::recode(
+      geneId,
+      "MtrunA17_Chr4g0006371" = "anthocyanidin synthase",
+      "MtrunA17_Chr7g0242551" = "flavonol synthase",
+      "MtrunA17_Chr4g0008521" = "laccase",
+      "MtrunA17_Chr5g0399861" = "MtJAZ1",
+      "MtrunA17_Chr5g0399881" = "MtJAZ2",
+      "MtrunA17_Chr8g0342991" = "lipoxygenase",
+      "MtrunA17_Chr3g0119681" = "MtCYP94B55",
+      "MtrunA17_Chr6g0476831" = "MtKunitz40",
+      "MtrunA17_Chr6g0476961" = "MtKunitz36",
+      "MtrunA17_Chr2g0317751" = "MtDEF1",
+      .default = NA_character_
+    )
+  ) %>%
+  arrange(Regulation)
+
+write_csv(
+  mtnac47_volcano_data,
+  file.path(table_dir, "MtNAC47_transient_DEG_volcano.csv")
+)
+
+mtnac47_deg_direction_plot <- ggplot(
+  mtnac47_volcano_data,
+  aes(
+    x = log2FoldChange,
+    y = plot_neg_log10_padj,
+    color = Regulation
+  )
+) +
+  geom_point(
+    data = dplyr::filter(mtnac47_volcano_data, is.na(volcano_label)),
+    size = 1.1,
+    alpha = 0.75
+  ) +
+  geom_point(
+    data = dplyr::filter(mtnac47_volcano_data, !is.na(volcano_label)),
+    aes(fill = Regulation),
+    shape = 21,
+    size = 2,
+    stroke = 0.8,
+    color = "black",
+    show.legend = FALSE
+  ) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed",
+    linewidth = 0.35,
+    color = "grey40"
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linewidth = 0.35,
+    color = "grey40"
+  ) +
+  ggrepel::geom_text_repel(
+    data = dplyr::filter(mtnac47_volcano_data, !is.na(volcano_label)),
+    aes(label = volcano_label),
+    color = "black",
+    size = 2.5,
+    max.overlaps = Inf,
+    min.segment.length = 0,
+    box.padding = 0.2,
+    point.padding = 0.15,
+    segment.size = 0.25,
+    segment.color = "grey40",
+    show.legend = FALSE
+  ) +
+  scale_color_manual(
+    values = c(
+      "Upregulated" = "#D73027",
+      "Downregulated" = "#4575B4",
+      "Not significant" = "grey75"
+    ),
+    breaks = c("Upregulated", "Downregulated", "Not significant")
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Upregulated" = "#D73027",
+      "Downregulated" = "#4575B4",
+      "Not significant" = "grey75"
+    ),
+    guide = "none"
+  ) +
+  labs(
+    title = "MtNAC47 transient-expression DEGs",
+    subtitle = "MtNAC11 construct versus Empty vector",
+    x = "log2 fold change",
+    y = expression(-log[10]~adjusted~italic(P)),
+    color = NULL,
+    caption = "Genes with -log10 adjusted P above 20 are shown at 20."
+  ) +
+  coord_cartesian(ylim = c(0, 22)) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "top"
+  )
+
+ggsave(
+  file.path(figure_dir, "MtNAC47_transient_DEG_volcano.png"),
+  mtnac47_deg_direction_plot,
+  width = 9,
+  height = 7.5,
+  dpi = 600,
+  bg = "white"
+)
+ggsave(
+  file.path(figure_dir, "MtNAC47_transient_DEG_volcano.pdf"),
+  mtnac47_deg_direction_plot,
+  width = 9,
+  height = 7.5,
+  bg = "white"
+)
+
+mtnac47_deg_direction_plot
+```
+
+# GO enrichment of MtNAC47 upregulated genes
+
+The query is the upregulated MtNAC11-versus-Empty genes. The background is
+every gene tested in that comparison. Enrichment uses topGO's classic Fisher
+test. Benjamini–Hochberg correction is applied across every tested Biological
+Process term, and terms with adjusted p < 0.05 are called significant.
+
+```{r go-enrichment-mtnac47-upregulated-classic}
+if (!requireNamespace("topGO", quietly = TRUE) ||
+    !requireNamespace("GO.db", quietly = TRUE)) {
+  stop(
+    "topGO and GO.db are required. Install them with: ",
+    "BiocManager::install(c('topGO', 'GO.db'))"
+  )
+}
+suppressPackageStartupMessages({
+  library(topGO)
+  library(GO.db)
+})
+
+# Reload the prepared GO mapping when this chunk is run independently.
+go_sets_file <- here(
+  "MT_genome", "annotation", "GO_gene_sets_MtrunA17r5.rds"
+)
+go_pairs_file <- here(
+  "MT_genome", "annotation", "GO_gene_pairs_MtrunA17r5.tsv"
+)
+GO2genes_pairwise <- if (file.exists(go_sets_file)) {
+  readRDS(go_sets_file)
+} else {
+  NULL
+}
+
+valid_pairwise_go_sets <- is.list(GO2genes_pairwise) &&
+  !is.null(names(GO2genes_pairwise)) &&
+  length(GO2genes_pairwise) > 0 &&
+  mean(grepl("^GO:", names(GO2genes_pairwise))) > 0.9
+
+if (!valid_pairwise_go_sets) {
+  pairwise_go_pairs <- read_tsv(
+    go_pairs_file,
+    col_types = cols(.default = col_character()),
+    show_col_types = FALSE
+  ) %>%
+    dplyr::transmute(gene = LOCUS_TAG, go = GO) %>%
+    dplyr::filter(
+      !is.na(gene), gene != "",
+      !is.na(go), go != ""
+    ) %>%
+    dplyr::distinct(gene, go)
+  GO2genes_pairwise <- split(
+    pairwise_go_pairs$gene,
+    pairwise_go_pairs$go
+  )
+}
+
+mtnac47_go_background <- unique(mtnac47_tested_genes)
+mtnac47_up_query <- intersect(
+  mtnac47_upregulated_genes$geneId,
+  mtnac47_go_background
+)
+if (length(mtnac47_up_query) < 5L) {
+  stop(
+    "Fewer than 5 upregulated MtNAC47 genes are in the tested-gene background."
+  )
+}
+
+mtnac47_up_gene_list <- factor(
+  as.integer(mtnac47_go_background %in% mtnac47_up_query),
+  levels = c(0, 1)
+)
+names(mtnac47_up_gene_list) <- mtnac47_go_background
+
+mtnac47_up_go_data <- methods::new(
+  "topGOdata",
+  ontology = "BP",
+  allGenes = mtnac47_up_gene_list,
+  geneSel = function(x) x == "1",
+  annot = topGO::annFUN.GO2genes,
+  GO2genes = GO2genes_pairwise,
+  nodeSize = 5
+)
+mtnac47_up_fisher <- topGO::runTest(
+  mtnac47_up_go_data,
+  algorithm = "classic",
+  statistic = "fisher"
+)
+
+mtnac47_up_go_results <- topGO::GenTable(
+  mtnac47_up_go_data,
+  Fisher = mtnac47_up_fisher,
+  orderBy = "Fisher",
+  ranksOf = "Fisher",
+  topNodes = length(topGO::score(mtnac47_up_fisher)),
+  numChar = 200
+) %>%
+  mutate(
+    TF = "MtNAC47",
+    upregulated_gene_count = length(mtnac47_up_query),
+    background_gene_count = length(mtnac47_go_background),
+    Fisher_pvalue = unname(topGO::score(mtnac47_up_fisher)[GO.ID]),
+    padj = p.adjust(Fisher_pvalue, method = "BH"),
+    Significant_num = suppressWarnings(as.numeric(Significant)),
+    Expected_num = suppressWarnings(as.numeric(Expected)),
+    FoldEnrichment = if_else(
+      is.finite(Expected_num) & Expected_num > 0,
+      Significant_num / Expected_num,
+      NA_real_
+    )
+  ) %>%
+  relocate(
+    TF,
+    upregulated_gene_count,
+    background_gene_count
+  ) %>%
+  arrange(padj, Fisher_pvalue)
+
+mtnac47_up_go_significant <- mtnac47_up_go_results %>%
+  filter(!is.na(padj), padj < 0.05)
+
+mtnac47_up_go_csv <- file.path(
+  table_dir,
+  "MtNAC47_transient_upregulated_classic_topGO_BP.csv"
+)
+mtnac47_up_go_sig_csv <- file.path(
+  table_dir,
+  "MtNAC47_transient_upregulated_classic_topGO_BP_significant.csv"
+)
+write_csv(mtnac47_up_go_results, mtnac47_up_go_csv)
+write_csv(mtnac47_up_go_significant, mtnac47_up_go_sig_csv)
+
+cat(
+  "MtNAC47 upregulated classic GO:\n",
+  "  Query genes: ", length(mtnac47_up_query), "\n",
+  "  Background genes: ", length(mtnac47_go_background), "\n",
+  "  Tested BP terms: ", nrow(mtnac47_up_go_results), "\n",
+  "  Significant terms: ", nrow(mtnac47_up_go_significant),
+  " -> ", mtnac47_up_go_sig_csv, "\n",
+  sep = ""
+)
+
+knitr::kable(
+  mtnac47_up_go_significant,
+  caption = "Significant classic BP terms for MtNAC47 upregulated genes"
+)
+```
+
+# MtNAC47 upregulated GO terms by class
+
+The plot shows selected significant terms grouped by biological class. Parent terms
+that repeat the same genes are omitted, including the broader jasmonate
+response terms, defense response, and the branched-chain amino acid child
+term. Jasmonate signaling and oxylipin biosynthesis stay as separate hormone
+terms, and the protease term is shown as peptide regulation.
+
+```{r plot-existing-mtnac47-upregulated-go, fig.width=7.2, fig.height=2.8}
+existing_mtnac47_up_go_file <- file.path(
+  table_dir,
+  "MtNAC47_transient_upregulated_classic_topGO_BP_significant.csv"
+)
+if (!file.exists(existing_mtnac47_up_go_file)) {
+  stop(
+    "MtNAC47 classic upregulated GO file is missing: ",
+    existing_mtnac47_up_go_file
+  )
+}
+
+mtnac47_go_class_levels <- c(
+  "Peptide regulation",
+  "Hormone signaling",
+  "Defense and stress",
+  "Lipid metabolism",
+  "Amino acid metabolism",
+  "ROS metabolism"
+)
+mtnac47_go_highlights <- c(
+  "GO:0010466" = "Peptide regulation",
+  "GO:2000022" = "Hormone signaling",
+  "GO:0031408" = "Hormone signaling",
+  "GO:0009611" = "Defense and stress",
+  "GO:0034440" = "Lipid metabolism",
+  "GO:0006633" = "Lipid metabolism",
+  "GO:0009063" = "Amino acid metabolism",
+  "GO:0042744" = "ROS metabolism"
+)
+
+existing_mtnac47_up_go_plot_data <- read_csv(
+  existing_mtnac47_up_go_file,
+  show_col_types = FALSE
+) %>%
+  filter(GO.ID %in% names(mtnac47_go_highlights)) %>%
+  mutate(
+    padj = as.numeric(padj),
+    Significant_num = as.numeric(Significant_num),
+    FoldEnrichment = as.numeric(FoldEnrichment),
+    neg_log10_padj = -log10(padj),
+    GO_class = unname(mtnac47_go_highlights[GO.ID]),
+    GO_class = factor(GO_class, levels = mtnac47_go_class_levels)
+  ) %>%
+  arrange(GO_class, padj, desc(FoldEnrichment)) %>%
+  mutate(
+    TermLabel = stringr::str_wrap(Term, width = 38),
+    TermLabel = factor(TermLabel, levels = rev(TermLabel))
+  )
+
+write_csv(
+  existing_mtnac47_up_go_plot_data %>%
+    mutate(TermLabel = as.character(TermLabel)),
+  file.path(
+    table_dir,
+    "MtNAC47_transient_upregulated_classic_topGO_BP_classified.csv"
+  )
+)
+
+existing_mtnac47_up_go_plot <- ggplot(
+  existing_mtnac47_up_go_plot_data,
+  aes(
+    x = FoldEnrichment,
+    y = TermLabel,
+    size = Significant_num,
+    color = neg_log10_padj
+  )
+) +
+  geom_segment(
+    aes(x = 0, xend = FoldEnrichment, y = TermLabel, yend = TermLabel),
+    inherit.aes = FALSE,
+    color = "#D9D9D9",
+    linewidth = 0.35
+  ) +
+  geom_point(alpha = 0.95) +
+  scale_color_viridis_c(
+    option = "viridis",
+    direction = -1,
+    name = expression(-log[10](italic(p)[adj]))
+  ) +
+  scale_size_continuous(
+    range = c(2.6, 6.5),
+    name = "Upregulated genes"
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.01, 0.06))
+  ) +
+  scale_y_discrete(
+    expand = expansion(add = 0.22)
+  ) +
+  coord_cartesian(clip = "off") +
+  guides(
+    color = guide_colorbar(
+      barwidth = grid::unit(0.28, "cm"),
+      barheight = grid::unit(1.8, "cm")
+    ),
+    size = guide_legend(
+      override.aes = list(color = "grey35"),
+      order = 2
+    )
+  ) +
+  labs(
+    x = "Fold enrichment",
+    y = NULL
+  ) +
+  theme_classic(base_size = 9) +
+  theme(
+    axis.text.y = element_text(size = 8, lineheight = 0.9),
+    axis.text.x = element_text(size = 8),
+    axis.title.x = element_text(size = 9),
+    legend.position = "right",
+    legend.key.size = grid::unit(0.32, "cm"),
+    legend.text = element_text(size = 7),
+    legend.title = element_text(size = 8),
+    legend.spacing.y = grid::unit(0.08, "cm"),
+    legend.box.spacing = grid::unit(0.12, "cm"),
+    legend.margin = margin(0, 0, 0, 0),
+    plot.margin = margin(6, 6, 2, 2)
+  )
+
+ggsave(
+  file.path(
+    figure_dir,
+    "MtNAC47_transient_upregulated_classic_GO_by_class.png"
+  ),
+  existing_mtnac47_up_go_plot,
+  width = 7.2,
+  height = 2.8,
+  dpi = 600,
+  bg = "white"
+)
+ggsave(
+  file.path(
+    figure_dir,
+    "MtNAC47_transient_upregulated_classic_GO_by_class.pdf"
+  ),
+  existing_mtnac47_up_go_plot,
+  width = 7.2,
+  height = 2.8,
+  bg = "white"
+)
+
+existing_mtnac47_up_go_plot
+```
+
+
